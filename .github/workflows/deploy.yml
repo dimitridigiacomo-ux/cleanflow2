@@ -25,8 +25,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Inject Gemini API key
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          sed -i "s|__GEMINI_API_KEY__|${{ secrets.GEMINI_API_KEY }}|g" index.html
+          python3 -c "
+          import os
+          key = os.environ['GEMINI_KEY']
+          with open('index.html', 'r') as f:
+              content = f.read()
+          content = content.replace('__GEMINI_API_KEY__', key)
+          with open('index.html', 'w') as f:
+              f.write(content)
+          print(f'Injected key: {key[:8]}...')
+          "
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
