@@ -28,16 +28,32 @@ jobs:
         env:
           GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python3 -c "
-          import os
-          key = os.environ['GEMINI_KEY']
-          with open('index.html', 'r') as f:
-              content = f.read()
-          content = content.replace('__GEMINI_API_KEY__', key)
-          with open('index.html', 'w') as f:
-              f.write(content)
-          print(f'Injected key: {key[:8]}...')
-          "
+          python3 - <<'PY'
+          import os, json
+          from pathlib import Path
+
+          key = os.environ.get("GEMINI_KEY", "").strip()
+
+          if not key:
+              raise RuntimeError("GEMINI_API_KEY secret is empty or missing")
+
+          if not key.startswith("AIza"):
+              raise RuntimeError(f"GEMINI_API_KEY does not look like a Gemini key (got: {key[:6]}...)")
+
+          path = Path("index.html")
+          content = path.read_text(encoding="utf-8")
+
+          placeholder = '"__GEMINI_API_KEY__"'
+          count = content.count(placeholder)
+
+          if count != 1:
+              raise RuntimeError(f"Expected exactly 1 quoted placeholder, found {count}")
+
+          content = content.replace(placeholder, json.dumps(key))
+          path.write_text(content, encoding="utf-8")
+
+          print(f"✓ Injected Gemini key: {key[:8]}... (length={len(key)})")
+          PY
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
