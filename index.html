@@ -45,6 +45,7 @@ const SHEET_URLS = {
   properties:  'https://docs.google.com/spreadsheets/d/e/2PACX-1vTmvtw8CqyYrqnZDdfHsWJj2A7w8n7Yc2yQ2cBQKip7dqoyx5WR-aqx90jK46SvFw/pub?gid=51504463&single=true&output=csv',
   training:    'https://docs.google.com/spreadsheets/d/e/2PACX-1vTmvtw8CqyYrqnZDdfHsWJj2A7w8n7Yc2yQ2cBQKip7dqoyx5WR-aqx90jK46SvFw/pub?gid=1263547040&single=true&output=csv',
   hostawayMap: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTmvtw8CqyYrqnZDdfHsWJj2A7w8n7Yc2yQ2cBQKip7dqoyx5WR-aqx90jK46SvFw/pub?gid=1508425661&single=true&output=csv',
+  extraDuties: 'PASTE_EXTRA_DUTIES_CSV_URL_HERE', // add gid after publishing ExtraDuties tab
 };
 
 const CL_PALETTE=['#E8734A','#4A90D9','#7B68EE','#3DAB6D','#D9A84A','#C2506F','#4ABFBF','#8B7355','#E85D5D','#5DAE8B','#9B59B6','#E67E22','#1ABC9C','#3498DB','#E74C3C','#2ECC71','#F39C12','#8E44AD','#16A085','#D35400','#27AE60'];
@@ -307,12 +308,189 @@ const parseHostawayMapCSV = rows => {
   return map;
 };
 
+// ── EXTRA DUTIES global (replaced on Sheet load) ───────────────────────────
+let EXTRA_DUTIES = [];
+
+// ── JOB HELPERS ─────────────────────────────────────────────────────────────
+// Use job.duration first (extra jobs), then property duration, then 0
+const getJobDuration = job => {
+  if(job.duration && Number(job.duration) > 0) return Number(job.duration);
+  const prop = PROPERTIES.find(p => p.id === job.propertyId);
+  return prop?.duration || 0;
+};
+
+// Use job.cleanersRequired (extra jobs) or property cleanersRequired
+const getJobRequiredCleaners = job => {
+  if(job.cleanersRequired && Number(job.cleanersRequired)>0) return Number(job.cleanersRequired);
+  const prop=PROPERTIES.find(p=>p.id===job.propertyId);
+  if(prop?.cleanersRequired) return prop.cleanersRequired;
+  if(prop?.requires2) return 2;
+  return 1;
+};
+// Training check only applies to jobs with a known property
+const jobRequiresTraining = job => !!job.propertyId;
+// Use job.displayName, temporaryLocationName, or property name
+const getJobDisplayName = job => {
+  if(job.displayName) return job.displayName;
+  if(job.temporaryLocationName) return job.temporaryLocationName;
+  const prop = PROPERTIES.find(p => p.id === job.propertyId);
+  return prop?.name || 'Unknown location';
+};
+
+// ── EXTRA DUTIES PARSER ──────────────────────────────────────────────────────
+// Columns: Date | Property | Temporary Location | Service Type | Start Time |
+//          Duration | Cleaner 1 | Cleaner 2 | Cleaner 3 | Priority | Notes
+// Row 1=title, Row 2=subtitle, Row 3=header, Row 4+=data
+const parseExtraDutiesCSVWithDiagnostics = (rows, weekOffset=0, propertiesList=PROPERTIES, cleanersList=CLEANERS) => {
+  const weekDates = getWeekDates(weekOffset);
+  const weekMon = weekDates[0];
+  const weekSun = weekDates[6];
+  weekMon.setHours(0,0,0,0);
+  weekSun.setHours(23,59,59,999);
+
+  const parseDate = s => {
+    const clean = (s||'').trim();
+    // DD/MM/YYYY or D/M/YYYY
+    const dmy = clean.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+    if(dmy) return new Date(parseInt(dmy[3]), parseInt(dmy[2])-1, parseInt(dmy[1]));
+    // YYYY-MM-DD
+    const ymd = clean.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
+    if(ymd) return new Date(parseInt(ymd[1]), parseInt(ymd[2])-1, parseInt(ymd[3]));
+    return null;
+  };
+
+  const dataRows = rows.slice(3).filter(r => r.some(c => (c||'').trim()));
+  const totalRows = dataRows.length;
+
+  const unresolvedProperties=[], unresolvedCleaners=[], invalidServiceTypes=[];
+  const rowsWithoutLocation=[], rowsWithNoCleaner=[];
+  const serviceTypeCounts={}, priorityCounts={};
+  const jobs=[];
+  let rowsInSelectedWeek=0;
+
+  dataRows.forEach(r => {
+    const dateRaw = (r[0]||'').trim();
+    const date = parseDate(dateRaw);
+    if(!date || isNaN(date.getTime())) return;
+    if(date < weekMon || date > weekSun) return;
+    rowsInSelectedWeek++;
+
+    const propRaw = (r[1]||'').trim();
+    const tempLoc = (r[2]||'').trim();
+    const stRaw   = (r[3]||'').trim();
+    const startTime = (r[4]||'09:00').trim();
+    const duration  = parseFloat(r[5])||0;
+    const priority  = (r[9]||'Normal').trim()||'Normal';
+    const note      = (r[10]||'').trim();
+
+    // Resolve property
+    let propertyId = '';
+    if(propRaw){
+      propertyId = resolvePropertyId(propRaw, propertiesList);
+      if(!propertyId) unresolvedProperties.push(propRaw);
+    }
+
+    // Must have property or temporary location
+    if(!propertyId && !tempLoc){
+      rowsWithoutLocation.push(dateRaw);
+      return;
+    }
+
+    // Resolve cleaners
+    const cleanerIds = [r[6],r[7],r[8]].map(c => {
+      const raw = (c||'').trim();
+      if(!raw) return null;
+      const id = resolveCleanerId(raw, cleanersList);
+      if(!id && raw.toLowerCase()!=='da assegnare') unresolvedCleaners.push(raw);
+      return id;
+    }).filter(Boolean);
+
+    // Normalize service type — infer from context
+    const normalized = normalizeServiceTypeId(stRaw);
+    let serviceTypeId = normalized;
+    if(!serviceTypeId){
+      if(stRaw) invalidServiceTypes.push(stRaw);
+      if(propertyId){
+        const prop = propertiesList.find(p=>p.id===propertyId);
+        if(prop?.type==='office') serviceTypeId='OFFICE_CLEAN';
+        else if(prop?.type==='restaurant') serviceTypeId='RESTAURANT_CLEAN';
+        else serviceTypeId='OTHER';
+      } else {
+        serviceTypeId='OTHER';
+      }
+    }
+
+    if(cleanerIds.length===0) rowsWithNoCleaner.push(`${dateRaw} — ${propRaw||tempLoc}`);
+    serviceTypeCounts[serviceTypeId]=(serviceTypeCounts[serviceTypeId]||0)+1;
+    priorityCounts[priority]=(priorityCounts[priority]||0)+1;
+
+    // Build day key
+    const dow = date.getDay(); // 0=Sun
+    const dayKey = DAYS[dow===0?6:dow-1];
+
+    // Display name
+    const prop = propertiesList.find(p=>p.id===propertyId);
+    const displayName = prop?.name || tempLoc || propRaw || 'Unknown';
+
+    // ISO date string
+    const pad = n => String(n).padStart(2,'0');
+    const dateISO = `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;
+
+    jobs.push({
+      id: uid(),
+      day: dayKey,
+      dateISO,
+      propertyId,
+      temporaryLocationName: tempLoc,
+      displayName,
+      serviceTypeId,
+      cleanerIds,
+      startTime,
+      duration,
+      priority,
+      note,
+      type: 'extra',
+      source: 'extra',
+    });
+  });
+
+  return {
+    jobs,
+    diagnostics:{
+      totalRows,
+      rowsInSelectedWeek,
+      importedRows: jobs.length,
+      skippedRows: rowsInSelectedWeek - jobs.length,
+      unresolvedProperties: [...new Set(unresolvedProperties)],
+      unresolvedCleaners: [...new Set(unresolvedCleaners)],
+      invalidServiceTypes: [...new Set(invalidServiceTypes)],
+      rowsWithoutLocation,
+      rowsWithNoCleaner,
+      serviceTypeCounts,
+      priorityCounts,
+    },
+  };
+};
+
+// Wrapper for convenience
+const parseExtraDutiesCSV = (rows, weekOffset=0, propertiesList=PROPERTIES, cleanersList=CLEANERS) =>
+  parseExtraDutiesCSVWithDiagnostics(rows, weekOffset, propertiesList, cleanersList).jobs;
+
+
+
 // ── LOAD FROM GOOGLE SHEET ─────────────────────────────────────────────────────
-const loadSheetData = async () => {
-  const fetches=await Promise.allSettled(
-    Object.values(SHEET_URLS).map(url=>fetch(url).then(r=>r.text()))
+const loadSheetData = async (weekOffset=0) => {
+  const urlEntries = Object.entries(SHEET_URLS);
+  const fetches = await Promise.allSettled(
+    urlEntries.map(([,url]) => url.startsWith('PASTE_') ? Promise.reject('placeholder') : fetch(url).then(r=>r.text()))
   );
-  const [tmplRes,clRes,prRes,trRes,hmRes]=fetches;
+  const byKey = Object.fromEntries(urlEntries.map(([k],i) => [k, fetches[i]]));
+  const tmplRes = byKey.template;
+  const clRes   = byKey.cleaners;
+  const prRes   = byKey.properties;
+  const trRes   = byKey.training;
+  const hmRes   = byKey.hostawayMap;
+  const edRes   = byKey.extraDuties;
 
   const parsedCl  = clRes.status==='fulfilled'  ? parseCleanersCSV(parseCSV(clRes.value))    : null;
   const parsedPr  = prRes.status==='fulfilled'  ? parsePropertiesCSV(parseCSV(prRes.value))  : null;
@@ -325,13 +503,21 @@ const loadSheetData = async () => {
   const parsedTm = templateResult?.jobs||null;
   const parsedTemplateDiagnostics = templateResult?.diagnostics||null;
 
+  const extraResult = edRes.status==='fulfilled'
+    ? parseExtraDutiesCSVWithDiagnostics(parseCSV(edRes.value), weekOffset, parsedPr||PROPERTIES, parsedCl||CLEANERS)
+    : null;
+  const parsedEd = extraResult?.jobs||null;
+  const parsedExtraDiagnostics = extraResult?.diagnostics||null;
+
   return {
-    cleaners:    parsedCl&&parsedCl.length>0    ? parsedCl  : null,
-    properties:  parsedPr&&parsedPr.length>0    ? parsedPr  : null,
-    training:    parsedTr&&Object.keys(parsedTr).length>0 ? parsedTr : null,
-    template:    parsedTm&&parsedTm.length>0    ? parsedTm  : null,
-    hostawayMap: parsedHm&&Object.keys(parsedHm).length>0? parsedHm : null,
-    templateDiagnostics: parsedTemplateDiagnostics,
+    cleaners:               parsedCl&&parsedCl.length>0             ? parsedCl  : null,
+    properties:             parsedPr&&parsedPr.length>0             ? parsedPr  : null,
+    training:               parsedTr&&Object.keys(parsedTr).length>0? parsedTr  : null,
+    template:               parsedTm&&parsedTm.length>0             ? parsedTm  : null,
+    hostawayMap:            parsedHm&&Object.keys(parsedHm).length>0? parsedHm  : null,
+    templateDiagnostics:    parsedTemplateDiagnostics,
+    extraDuties:            parsedEd&&parsedEd.length>0             ? parsedEd  : null,
+    extraDutiesDiagnostics: parsedExtraDiagnostics,
   };
 };
 
@@ -452,22 +638,22 @@ const detectConflicts = jobs => {
   const out = new Map();
   const add = (id, issue) => { if(!out.has(id)) out.set(id,[]); out.get(id).push(issue); };
   jobs.forEach(job => {
-    const prop=PROPERTIES.find(p=>p.id===job.propertyId); if(!prop) return;
-    const jS=t2m(job.startTime), jE=jS+prop.duration*60;
-    const required=prop.cleanersRequired||(prop.requires2?2:1);
+    const jS=t2m(job.startTime), jE=jS+getJobDuration(job)*60;
+    const required=getJobRequiredCleaners(job);
     if(job.cleanerIds.length<required)
       add(job.id,{type:'staffing',msg:`Richiede ${required} cleaner${required>1?'s':''} — assegnate solo ${job.cleanerIds.length}`});
     job.cleanerIds.forEach(cId=>{
       const cl=CLEANERS.find(c=>c.id===cId); if(!cl) return;
       if(!cl.days.includes(job.day)) add(job.id,{type:'unavailable',cId,msg:`${cl.name}: non disponibile ${DAY_IT[job.day]}`});
-      if(!TRAINING[cId]?.includes(job.propertyId)) add(job.id,{type:'untrained',cId,msg:`${cl.name}: non formata per ${prop.name}`});
-      // FIX T04: report overlap on earlier job only; tie-break on id for same start time
+      // Training check only for jobs with a known property
+      if(jobRequiresTraining(job)&&!TRAINING[cId]?.includes(job.propertyId))
+        add(job.id,{type:'untrained',cId,msg:`${cl.name}: non formata per ${getJobDisplayName(job)}`});
+      // Overlap: temporary jobs block cleaner slots too — no prop required
       jobs.filter(o=>o.id!==job.id&&o.day===job.day&&o.cleanerIds.includes(cId)&&
         (t2m(o.startTime)>jS||(t2m(o.startTime)===jS&&o.id>job.id))
       ).forEach(o=>{
-        const oP=PROPERTIES.find(p=>p.id===o.propertyId); if(!oP) return;
-        const oS=t2m(o.startTime), oE=oS+oP.duration*60;
-        if(jS<oE&&jE>oS) add(job.id,{type:'overlap',cId,msg:`${cl.name}: già a ${oP.name} (${o.startTime}–${m2t(oE)})`});
+        const oS=t2m(o.startTime), oE=oS+getJobDuration(o)*60;
+        if(jS<oE&&jE>oS) add(job.id,{type:'overlap',cId,msg:`${cl.name}: già a ${getJobDisplayName(o)} (${o.startTime}–${m2t(oE)})`});
       });
     });
   });
@@ -481,7 +667,7 @@ const getUncovered = jobs => PROPERTIES.filter(p=>
 // All properties without any job this week (informational only)
 const getAllUncovered = jobs => PROPERTIES.filter(p=>!jobs.some(j=>j.propertyId===p.id));
 const computeCleanerStats = jobs => CLEANERS.map(cl=>{
-  const assignedHrs=jobs.filter(j=>j.cleanerIds.includes(cl.id)).reduce((s,j)=>s+(PROPERTIES.find(p=>p.id===j.propertyId)?.duration||0),0);
+  const assignedHrs=jobs.filter(j=>j.cleanerIds.includes(cl.id)).reduce((s,j)=>s+getJobDuration(j),0);
   const availDays=DAYS.filter(d=>cl.days.includes(d)).length;
   const capacityHrs=cl.weeklyHrs||availDays*MAX_HRS[cl.type];
   const pct=capacityHrs>0?Math.min(100,Math.round(assignedHrs/capacityHrs*100)):0;
@@ -590,11 +776,11 @@ const runAutoSchedule = (allJobs, weekOffset=0) => {
 
   // Commit already-assigned jobs
   allJobs.filter(j=>j.cleanerIds.length>0).forEach(job=>{
-    const prop=PROPERTIES.find(p=>p.id===job.propertyId); if(!prop) return;
+    const dur=getJobDuration(job);
     job.cleanerIds.forEach(cId=>{
-      weeklyHrs[cId]=(weeklyHrs[cId]||0)+prop.duration;
-      dailyHrs[cId]?.[job.day] && (dailyHrs[cId][job.day]+=prop.duration);
-      daySched[cId]?.[job.day]?.push({start:t2m(job.startTime),end:t2m(job.startTime)+prop.duration*60});
+      weeklyHrs[cId]=(weeklyHrs[cId]||0)+dur;
+      dailyHrs[cId]?.[job.day] && (dailyHrs[cId][job.day]+=dur);
+      daySched[cId]?.[job.day]?.push({start:t2m(job.startTime),end:t2m(job.startTime)+dur*60});
     });
   });
 
@@ -604,13 +790,12 @@ const runAutoSchedule = (allJobs, weekOffset=0) => {
   });
 
   const newlyScheduled = unassigned.map(job=>{
-    const prop=PROPERTIES.find(p=>p.id===job.propertyId);
-    if(!prop) return {...job,status:'needs_review'};
-    const needed=prop.cleanersRequired||( prop.requires2?2:1);
-    const jS=t2m(job.startTime), jE=jS+prop.duration*60;
+    const needed=getJobRequiredCleaners(job);
+    const jS=t2m(job.startTime), jE=jS+getJobDuration(job)*60;
 
     const eligible=CLEANERS
-      .filter(cl=>TRAINING[cl.id]?.includes(job.propertyId))
+      // Training: only required if job has a known property
+      .filter(cl=>!jobRequiresTraining(job)||TRAINING[cl.id]?.includes(job.propertyId))
       .filter(cl=>cl.days.includes(job.day))
       // HARD: skip if daysOff in constraints
       .filter(cl=>!(constraints[cl.id]?.daysOff||[]).includes(job.day))
@@ -628,11 +813,11 @@ const runAutoSchedule = (allJobs, weekOffset=0) => {
         const bDailyLim = constraints[b.id]?.maxDailyHrs ?? b.dailyHrs;
         const aWeeklyLim = constraints[a.id]?.maxWeeklyHrs ?? a.weeklyHrs;
         const bWeeklyLim = constraints[b.id]?.maxWeeklyHrs ?? b.weeklyHrs;
-        const aOver  = aDailyLim  && (dailyHrs[a.id]?.[job.day]||0)+prop.duration > aDailyLim  ? 1 : 0;
-        const bOver  = bDailyLim  && (dailyHrs[b.id]?.[job.day]||0)+prop.duration > bDailyLim  ? 1 : 0;
+        const aOver  = aDailyLim  && (dailyHrs[a.id]?.[job.day]||0)+getJobDuration(job) > aDailyLim  ? 1 : 0;
+        const bOver  = bDailyLim  && (dailyHrs[b.id]?.[job.day]||0)+getJobDuration(job) > bDailyLim  ? 1 : 0;
         if(aOver!==bOver) return aOver-bOver;
-        const aWOver = aWeeklyLim && (weeklyHrs[a.id]||0)+prop.duration > aWeeklyLim ? 1 : 0;
-        const bWOver = bWeeklyLim && (weeklyHrs[b.id]||0)+prop.duration > bWeeklyLim ? 1 : 0;
+        const aWOver = aWeeklyLim && (weeklyHrs[a.id]||0)+getJobDuration(job) > aWeeklyLim ? 1 : 0;
+        const bWOver = bWeeklyLim && (weeklyHrs[b.id]||0)+getJobDuration(job) > bWeeklyLim ? 1 : 0;
         if(aWOver!==bWOver) return aWOver-bWOver;
         // Soft: prefer cleaners under their workDays limit (projected after this job)
         const getProjectedDays = (id, day) => { const s=new Set(Object.entries(dailyHrs[id]||{}).filter(([,h])=>h>0).map(([d])=>d)); s.add(day); return s.size; };
@@ -643,13 +828,15 @@ const runAutoSchedule = (allJobs, weekOffset=0) => {
       });
 
     const pick=eligible.slice(0,needed);
+    const jobDur=getJobDuration(job);
     pick.forEach(cl=>{
-      weeklyHrs[cl.id]=(weeklyHrs[cl.id]||0)+prop.duration;
-      dailyHrs[cl.id]?.[job.day] && (dailyHrs[cl.id][job.day]+=prop.duration);
+      weeklyHrs[cl.id]=(weeklyHrs[cl.id]||0)+jobDur;
+      dailyHrs[cl.id]?.[job.day] && (dailyHrs[cl.id][job.day]+=jobDur);
       daySched[cl.id]?.[job.day]?.push({start:jS,end:jE});
     });
 
     // Build specific soft-limit warnings per cleaner
+    const jobDurFinal=getJobDuration(job);
     const warnings=[];
     pick.forEach(cl=>{
       const c=constraints[cl.id];
@@ -685,9 +872,10 @@ const buildSystemPrompt=(jobs,weekOffset)=>{
     const ds=`${dates[i].getDate()} ${MON_IT[dates[i].getMonth()]}`;
     if(!dj.length) return `${DAY_FULL[day]} ${ds}: nessun turno`;
     return `${DAY_FULL[day]} ${ds}:\n`+dj.map(j=>{
-      const p=PROPERTIES.find(x=>x.id===j.propertyId);
+      const name=getJobDisplayName(j);
+      const dur=getJobDuration(j);
       const n=j.cleanerIds.map(id=>CLEANERS.find(c=>c.id===id)?.name).filter(Boolean).join(' + ');
-      return `  • ${p?.name} ${j.startTime}–${tAdd(j.startTime,p?.duration||0)} → ${n||'NON ASSEGNATO'} [${j.type}]${j.note?' ('+j.note+')':''}`;
+      return `  • ${name} ${j.startTime}–${tAdd(j.startTime,dur)} → ${n||'NON ASSEGNATO'} [${j.type}]${j.note?' ('+j.note+')':''}`;
     }).join('\n');
   }).join('\n');
   const ci=CLEANERS.map(c=>{
@@ -712,18 +900,19 @@ const exportWIW = (jobs, weekOffset) => {
     return dd!==0?dd:t2m(a.startTime)-t2m(b.startTime);
   });
   sorted.forEach(job=>{
-    const prop=PROPERTIES.find(p=>p.id===job.propertyId); if(!prop) return;
+    const prop=PROPERTIES.find(p=>p.id===job.propertyId);
     const di=DAYS.indexOf(job.day);
-    const dateStr=fmtDate(dates[di]);
+    const dateStr=job.dateISO?fmtDate(new Date(job.dateISO+'T00:00:00')):fmtDate(dates[di]);
     const start=fmtAMPM(job.startTime);
-    const end=fmtAMPM(tAdd(job.startTime,prop.duration));
+    const end=fmtAMPM(tAdd(job.startTime,getJobDuration(job)));
+    const siteName=getJobDisplayName(job);
     if(job.cleanerIds.length===0){
-      rows.push(['UNASSIGNED','',dateStr,start,end,prop.name,'',job.note||'',job.type||'']);
+      rows.push(['UNASSIGNED','',dateStr,start,end,siteName,'',job.note||'',job.type||'']);
     } else {
       job.cleanerIds.forEach(cId=>{
         const cl=CLEANERS.find(c=>c.id===cId); if(!cl) return;
         const [first,...rest]=cl.name.split(' ');
-        rows.push([first,rest.join(' '),dateStr,start,end,prop.name,cl.type==='senior'?'Senior Cleaner':'Cleaner',job.note||'',job.type||'']);
+        rows.push([first,rest.join(' '),dateStr,start,end,siteName,cl.type==='senior'?'Senior Cleaner':'Cleaner',job.note||'',job.type||'']);
       });
     }
   });
@@ -1073,10 +1262,12 @@ function GenerateModal({result,constraints,onConfirm,onClose,onGenerate}){
 // ── JOB CARD ──────────────────────────────────────────────────────────────────
 function JobCard({job,conflicts,onClick,onFix,highlight}){
   const prop=PROPERTIES.find(p=>p.id===job.propertyId);
+  const displayName=getJobDisplayName(job);
+  const jobDuration=getJobDuration(job);
   const cls=job.cleanerIds.map(id=>CLEANERS.find(c=>c.id===id)).filter(Boolean);
   const issues=conflicts?.get(job.id)||[];
   const hasC=issues.length>0;
-  const endT=prop?tAdd(job.startTime,prop.duration):'';
+  const endT=tAdd(job.startTime,jobDuration);
   const typeBg={template:'#E8F0FE',checkout:'#FFF0E8',extra:'#F0FFF4'}[job.type]||'#F0EDE8';
   const typeColor={template:'#2A5FA0',checkout:'#C05000',extra:'#166534'}[job.type]||C.muted;
   const typeLabel={template:'Template',checkout:'Checkout',extra:'Extra'}[job.type]||job.type;
@@ -1091,8 +1282,8 @@ function JobCard({job,conflicts,onClick,onFix,highlight}){
           <div style={{display:'flex',alignItems:'center',gap:10}}>
             <span style={{fontSize:22}}>{TI(prop?.type)}</span>
             <div>
-              <div style={{fontWeight:800,fontSize:15,color:C.text,lineHeight:1.2}}>{prop?.name}</div>
-              <div style={{fontSize:12,color:C.muted,marginTop:2}}>{job.startTime} – {endT} · {prop?.duration}h</div>
+              <div style={{fontWeight:800,fontSize:15,color:C.text,lineHeight:1.2}}>{displayName}</div>
+              <div style={{fontSize:12,color:C.muted,marginTop:2}}>{job.startTime} – {endT} · {jobDuration}h</div>
             </div>
           </div>
           <div style={{display:'flex',alignItems:'center',gap:6}}>
@@ -1802,6 +1993,7 @@ function App(){
   const dataReady = sheetStatus==='ok';
   const [sheetInfo,    setSheetInfo   ]=useState('');
   const [templateDiagnostics, setTemplateDiagnostics]=useState(null);
+  const [extraDutiesDiagnostics, setExtraDutiesDiagnostics]=useState(null);
   const [dataVersion,  setDataVersion ]=useState(0);
   // Workflow state machine
   const [wf, setWf]=useState({templateLoaded:false,hostawayLoaded:false,shiftsGenerated:false,staleGeneration:false});
@@ -1816,7 +2008,7 @@ function App(){
   // ── Load Google Sheet data — only after login ────────────────────────────
   useEffect(()=>{
     if(!authed) return; // wait for login first
-    loadSheetData().then(data=>{
+    loadSheetData(weekOffset).then(data=>{
       const loaded=[];
       if(data.cleaners){
         CLEANERS=data.cleaners;
@@ -1840,6 +2032,11 @@ function App(){
         loaded.push('Template: '+data.template.length+' turni');
       }
       if(data.templateDiagnostics) setTemplateDiagnostics(data.templateDiagnostics);
+      if(data.extraDuties){
+        EXTRA_DUTIES=data.extraDuties;
+        loaded.push('Extra Duties: '+data.extraDuties.length);
+      }
+      if(data.extraDutiesDiagnostics) setExtraDutiesDiagnostics(data.extraDutiesDiagnostics);
       if(data.hostawayMap){
         Object.assign(PROP_NAME_MAP, data.hostawayMap);
         loaded.push('Hostaway Map: '+Object.keys(data.hostawayMap).length);
@@ -1884,18 +2081,20 @@ function App(){
 
   // ── TEMPLATE LOAD (with deduplication + stale guard) ──
   const doLoadTemplate=(merge=false)=>{
-    const newJobs=SHEET_TEMPLATE.map(r=>({...r,id:uid(),status:'assigned'}));
+    const templateJobs=SHEET_TEMPLATE.map(r=>({...r,id:uid(),status:'assigned',source:'template'}));
+    const extraJobs=EXTRA_DUTIES.map(r=>({...r,id:r.id||uid(),status:'assigned'}));
     setJobs(prev=>{
       let base=merge?prev:[];
-      // FIX: deduplication — skip rows already matching propertyId+day+startTime
-      const toAdd=newJobs.filter(nj=>!base.some(e=>e.propertyId===nj.propertyId&&e.day===nj.day&&e.startTime===nj.startTime));
-      return [...base,...toAdd];
+      // Deduplicate template jobs
+      const toAddTemplate=templateJobs.filter(nj=>!base.some(e=>e.propertyId===nj.propertyId&&e.day===nj.day&&e.startTime===nj.startTime&&e.source==='template'));
+      // Deduplicate extra jobs by dateISO+displayName+startTime
+      const toAddExtra=extraJobs.filter(nj=>!base.some(e=>e.source==='extra'&&e.dateISO===nj.dateISO&&e.displayName===nj.displayName&&e.startTime===nj.startTime));
+      return [...base,...toAddTemplate,...toAddExtra];
     });
-    // Safeguard: if shifts already generated, mark stale
     setWf(w=>({...w,templateLoaded:true,staleGeneration:w.shiftsGenerated?true:w.staleGeneration}));
     setPlanningWeekOffset(weekOffset);
     setModal(null);
-    showToast(`✓ Template caricato${merge?' (merge)':''}`);
+    showToast(`✓ Template caricato${merge?' (merge)':''}${EXTRA_DUTIES.length>0?' · '+EXTRA_DUTIES.length+' extra duties':''}`);
   };
 
   // ── HOSTAWAY IMPORT (with stale guard) ──
@@ -2125,6 +2324,11 @@ function App(){
             </div>}
             {sheetStatus==='ok'&&sheetInfo&&<div style={{background:'#F0FFF4',borderBottom:'1px solid #86EFAC',padding:'5px 24px',fontSize:11,color:'#166534',display:'flex',alignItems:'center',gap:6}}>
               ✓ Sheet: {sheetInfo}
+              {extraDutiesDiagnostics&&<span style={{marginLeft:12,padding:'1px 8px',borderRadius:6,background:extraDutiesDiagnostics.importedRows>0?'#DBEAFE':'#E5E7EB',color:extraDutiesDiagnostics.importedRows>0?'#1D4ED8':'#6B7280',fontWeight:700}}>
+                {extraDutiesDiagnostics.importedRows>0?`📋 Extra Duties: ${extraDutiesDiagnostics.importedRows} questa settimana`:'Extra Duties: 0 questa settimana'}
+                {extraDutiesDiagnostics.rowsWithNoCleaner.length>0?` · ${extraDutiesDiagnostics.rowsWithNoCleaner.length} non assegnate`:''}
+                {(extraDutiesDiagnostics.unresolvedCleaners.length+extraDutiesDiagnostics.unresolvedProperties.length)>0?` · ⚠️ warning`:''}
+              </span>}
             </div>}
             {sheetStatus==='warn'&&sheetInfo&&<div style={{background:'#FFF3CD',borderBottom:'1px solid #FFCC02',padding:'5px 24px',fontSize:11,color:'#856404',display:'flex',alignItems:'center',gap:6}}>
               ⚠️ Sheet parziale: {sheetInfo} — Generazione potrebbe non essere affidabile
