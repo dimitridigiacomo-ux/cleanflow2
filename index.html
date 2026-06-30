@@ -3514,7 +3514,24 @@ function JobCard({job,conflicts,onClick,onFix,highlight,onFindSolution}){
 
 // ── WEEK VIEW ──────────────────────────────────────────────────────────────────
 function WeekView({jobs,conflicts,weekOffset,onDaySelect,onConflictDay,onLoadTemplate,onImportHostaway,onGenerate,wf,dataReady,genGate,trainingOk,trainingMissing,trainingMissingJobs,onFix,onFindSolution,highlightJobId,setHighlightJob,onAdd,onEdit}){
-  const totalC=conflicts.size;
+  // Review issues (staffing/gender shortfalls + needs_review status) are operationally
+  // different from real scheduling clashes (overlap, travel, late-rest, unavailable,
+  // untrained, window). detectConflicts() itself doesn't distinguish them — it lumps
+  // both into the same Map — so the split happens here, at display time only.
+  const reviewOnlyTypes = new Set(['staffing','gender']);
+  const isRealConflictIssue = issue => issue && !reviewOnlyTypes.has(issue.type);
+  const getRealConflictIssues = jobId => (conflicts.get(jobId)||[]).filter(isRealConflictIssue);
+  const realConflictJobIds = jobs
+    .filter(j => getRealConflictIssues(j.id).length > 0)
+    .map(j => j.id);
+  // realConflictCount drives the "Conflitti" pill and the red conflict-day box ONLY.
+  const realConflictCount = realConflictJobIds.length;
+  // issueCount drives the separate "Da rivedere" badge — union of needs_review status
+  // and ANY conflicts entry (including pure staffing/gender ones).
+  const issueCount=jobs.filter(j =>
+    j.status === 'needs_review' ||
+    (conflicts.get(j.id)||[]).length > 0
+  ).length;
   const dates=useMemo(()=>getWeekDates(weekOffset),[weekOffset]);
   const today=useMemo(()=>getTodayKey(),[]);
   const uncovered=useMemo(()=>getUncovered(jobs),[jobs]); // mandatory only (office/restaurant)
@@ -3523,9 +3540,10 @@ function WeekView({jobs,conflicts,weekOffset,onDaySelect,onConflictDay,onLoadTem
 
   return(
     <div style={{paddingBottom:8}}>
-      <div style={{display:'flex',gap:8,marginBottom:16}}>
+      <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap'}}>
         <StatPill label="Turni" value={jobs.length} color={C.nav}/>
-        <StatPill label="Conflitti" value={totalC} color={totalC>0?C.conflict:C.ok} onClick={totalC>0?()=>{const f=jobs.find(j=>conflicts.has(j.id));if(f)onConflictDay(f.day);}:undefined}/>
+        <StatPill label="Conflitti" value={realConflictCount} color={realConflictCount>0?C.conflict:C.ok} onClick={realConflictCount>0?()=>{const f=jobs.find(j=>getRealConflictIssues(j.id).length>0);if(f)onConflictDay(f.day);}:undefined}/>
+        {issueCount>0&&<StatPill label="Da rivedere" value={issueCount} color={C.amber}/>}
         <StatPill label="Ore pian." value={`${totalHrs}h`} color={C.blue}/>
       </div>
 
@@ -3566,11 +3584,11 @@ function WeekView({jobs,conflicts,weekOffset,onDaySelect,onConflictDay,onLoadTem
         );
       })()}
 
-      {totalC>0&&(
+      {realConflictCount>0&&(
         <div style={{background:'#FDE8E8',border:`1.5px solid ${C.conflict}30`,borderRadius:14,padding:'12px 16px',marginBottom:12}}>
           <div style={{fontSize:12,fontWeight:800,color:C.conflict,marginBottom:8}}>⚠️ Conflitti — tocca per andare al giorno</div>
-          {DAYS.filter(day=>jobs.some(j=>j.day===day&&conflicts.has(j.id))).map(day=>{
-            const dc=jobs.filter(j=>j.day===day&&conflicts.has(j.id));
+          {DAYS.filter(day=>jobs.some(j=>j.day===day&&getRealConflictIssues(j.id).length>0)).map(day=>{
+            const dc=jobs.filter(j=>j.day===day&&getRealConflictIssues(j.id).length>0);
             return(
               <button key={day} onClick={()=>onConflictDay(day)} style={{display:'flex',alignItems:'center',justifyContent:'space-between',width:'100%',background:C.card,borderRadius:10,padding:'9px 12px',marginBottom:6,border:`1px solid ${C.conflict}20`,cursor:'pointer',fontFamily:'inherit'}}>
                 <div style={{display:'flex',alignItems:'center',gap:8}}>
