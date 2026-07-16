@@ -3348,7 +3348,383 @@ const getExportJobIssues = job => {
   return issues;
 };
 
-// ── WIW XLSX EXPORT ────────────────────────────────────────────────────────────
+
+// ── FALLBACK REALLOCATION SUGGESTIONS (Fix 10K-A) ────────────────────────────
+// Second-pass, suggestion-only analysis.
+// Inspects the schedule AFTER runAutoSchedule and looks for "donor" checkout
+// jobs that could convert to fallback, releasing cleaners to fix "target" jobs.
+// NEVER mutates jobs or applies changes — supervisors confirm via UI.
+const buildFallbackReallocationSuggestions = (jobs, weekOffset = 0) => {
+  const diagnostics = { targetCount:0, donorCount:0, simulationsTried:0, validSuggestions:0 };
+  if(!Array.isArray(jobs) || jobs.length === 0) return { suggestions:[], diagnostics };
+
+  const constraints = buildConstraints(weekOffset);
+  const dates = getWeekDates(weekOffset);
+  const dayToISO = Object.fromEntries(DAYS.map((d,i)=>[d, dates[i]?toISODateLocal(dates[i]):'']));
+  const jobDateISO_ = j => j.dateISO || dayToISO[j.day] || '';
+
+  // ── Targets ────────────────────────────────────────────────────────────────
+  const targetJobs = jobs.filter(job => {
+    if(!isMeaningfulJob(job)) return false;
+    if(isLockedTemplateJob(job)) return false;
+    const ids = dedupeCleanerIds(job.cleanerIds);
+    const countOk  = ids.length >= getJobRequiredCleaners(job);
+    const genderOk = genderRequirementMet(job, ids);
+    return !countOk || !genderOk || job.status === 'needs_review';
+  });
+  diagnostics.targetCount = targetJobs.length;
+  if(targetJobs.length === 0) return { suggestions:[], diagnostics };
+
+  // ── Donors ────────────────────────────────────────────────────────────────
+  const donorJobs = jobs.filter(job => {
+    if(!isMeaningfulJob(job)) return false;
+    if(isLockedTemplateJob(job)) return false;
+    if(job.manualEdited || job.rescueUsed) return false;
+    if(['last_minute','extra','checkin'].includes(job.type)) return false;
+    if(!isCheckoutFallbackEligibleJob(job)) return false;
+    const fbConfig = getCheckoutFallbackConfig(job);
+    if(!fbConfig) return false;
+    if(job.fallbackUsed === true) return false;
+    const ids = dedupeCleanerIds(job.cleanerIds);
+    if(!genderRequirementMet(job, ids) || ids.length < getJobRequiredCleaners(job)) return false;
+    if(ids.length <= fbConfig.cleaners) return false;
+    const winEnd = job.windowEndTime || (PROPERTIES.find(p=>p.id===job.propertyId)||{}).cleaningWindowEnd || '22:00';
+    if(t2m(job.startTime) + fbConfig.duration * 60 > t2m(winEnd)) return false;
+    return true;
+  });
+  diagnostics.donorCount = donorJobs.length;
+  if(donorJobs.length === 0) return { suggestions:[], diagnostics };
+
+  // ── FIX 3: pure helper — compute cleaner hours from a simulated job array ──
+  const computeCleanerHoursFromJobs = (cleanerId, simulatedJobs) => {
+    let weekly = 0;
+    const daily = Object.fromEntries(DAYS.map(d=>[d,0]));
+    const workedDays = new Set();
+    simulatedJobs.forEach(job => {
+      if(!(job.cleanerIds||[]).includes(cleanerId)) return;
+      const dur = getCleanerEffectiveJobDuration(job, cleanerId);
+      weekly += dur;
+      if(DAYS.includes(job.day)){ daily[job.day] += dur; workedDays.add(job.day); }
+    });
+    return { weekly, daily, workedDays };
+  };
+
+  // ── FIX 6: baseline conflicts computed once before the loop ────────────────
+  const baselineConflicts = detectConflicts(jobs);
+  const getRealIssues = (conflictMap, jobId) =>
+    (conflictMap.get(jobId)||[]).filter(i=>
+      !['staffing','gender'].includes(i.type)
+    );
+
+  // ── Validate donor cleaner against fallback slot (FIX 8) ──────────────────
+  const isDonorCleanerValidForFallback = (cleaner, donor, fbConfig, simJobs) => {
+    if(jobRequiresTraining(donor) && !(TRAINING[cleaner.id]||[]).includes(donor.propertyId)) return false;
+    if(!cleaner.days.includes(donor.day)) return false;
+    if(isCleanerUnavailableOnDate(cleaner, jobDateISO_(donor))) return false;
+    if((constraints[cleaner.id]?.daysOff||[]).includes(donor.day)) return false;
+    const hrs = computeCleanerHoursFromJobs(cleaner.id, simJobs);
+    const dS = t2m(donor.startTime), dE = dS + fbConfig.duration * 60;
+    // FIX 2: correct max-end units
+    const maxEnd = constraints[cleaner.id]?.maxEndTime;
+    if(maxEnd && dE > t2m(maxEnd)) return false;
+    // Daily cap
+    if((hrs.daily[donor.day]||0) + fbConfig.duration > getEffectiveDailyLimit(cleaner, constraints)) return false;
+    // Max worked-days
+    if(!hrs.workedDays.has(donor.day) && hrs.workedDays.size >= getEffectiveMaxWorkedDays(cleaner)) return false;
+    // Overlap + travel + late-rest with other jobs on same day
+    const other = simJobs.filter(j => j.id!==donor.id && (j.cleanerIds||[]).includes(cleaner.id) && j.day===donor.day);
+    for(const oj of other){
+      const oS=t2m(oj.startTime), oE=oS+getJobDuration(oj)*60;
+      if(dS<oE && dE>oS) return false;
+      const earlier = dS<oS ? {startTime:donor.startTime,duration:fbConfig.duration,propertyId:donor.propertyId} : oj;
+      const later   = dS<oS ? oj : {startTime:donor.startTime,duration:fbConfig.duration,propertyId:donor.propertyId};
+      // FIX 1: correct travel units (both already in minutes)
+      const gap = t2m(later.startTime) - (t2m(earlier.startTime) + getJobDuration(earlier)*60);
+      if(gap < getTravelBufferMinutes(earlier, later)) return false;
+      if(getLateShiftRestIssue(cleaner.name, earlier, later)) return false;
+    }
+    return true;
+  };
+
+  // ── Validate whether a cleaner can be added to a target job ───────────────
+  const canAddCleanerToTarget = (cleaner, target, simJobsAfterDonorConvert) => {
+    const dISO = jobDateISO_(target);
+    if(jobRequiresTraining(target) && !(TRAINING[cleaner.id]||[]).includes(target.propertyId)) return false;
+    if(!cleaner.days.includes(target.day)) return false;
+    if(isCleanerUnavailableOnDate(cleaner, dISO)) return false;
+    if((constraints[cleaner.id]?.daysOff||[]).includes(target.day)) return false;
+    const tS = t2m(target.startTime), tE = tS + getJobDuration(target)*60;
+    // FIX 2: correct max-end units
+    const maxEnd = constraints[cleaner.id]?.maxEndTime;
+    if(maxEnd && tE > t2m(maxEnd)) return false;
+    // FIX 3: use simulated hours (donor already removed from cleaner's daily hours)
+    const hrs = computeCleanerHoursFromJobs(cleaner.id, simJobsAfterDonorConvert);
+    if((hrs.daily[target.day]||0) + getJobDuration(target) > getEffectiveDailyLimit(cleaner, constraints)) return false;
+    if(!hrs.workedDays.has(target.day) && hrs.workedDays.size >= getEffectiveMaxWorkedDays(cleaner)) return false;
+    // Overlap + travel + late-rest on target day
+    const other = simJobsAfterDonorConvert.filter(j=>j.id!==target.id&&(j.cleanerIds||[]).includes(cleaner.id)&&j.day===target.day);
+    for(const oj of other){
+      const oS=t2m(oj.startTime), oE=oS+getJobDuration(oj)*60;
+      if(tS<oE && tE>oS) return false;
+      const earlier = tS<oS ? target : oj;
+      const later   = tS<oS ? oj : target;
+      // FIX 1: correct travel units
+      const gap = t2m(later.startTime) - (t2m(earlier.startTime) + getJobDuration(earlier)*60);
+      if(gap < getTravelBufferMinutes(earlier, later)) return false;
+      if(getLateShiftRestIssue(cleaner.name, earlier, later)) return false;
+    }
+    return true;
+  };
+
+  // ── Combination generator (FIX 10: generate from sorted, not donorIds) ────
+  const MAX_DONOR_COMBINATIONS = 30;
+  const getReleaseCombinations = (donorIds, keepCount, target) => {
+    const releaseCount = donorIds.length - keepCount;
+    if(releaseCount <= 0 || releaseCount >= donorIds.length) return [];
+    const req = getJobGenderRequirement(target);
+    const existingTargetIds = dedupeCleanerIds(target.cleanerIds);
+    const haveM = existingTargetIds.filter(id=>(CLEANERS.find(c=>c.id===id)||{}).gender==='m').length;
+    const haveF = existingTargetIds.filter(id=>(CLEANERS.find(c=>c.id===id)||{}).gender==='f').length;
+    const needMaleOnTarget   = Math.max(0, Number(req.male)   - haveM) > 0;
+    const needFemaleOnTarget = Math.max(0, Number(req.female) - haveF) > 0;
+    // FIX 10: sort first, then generate combinations from sorted array
+    const sorted = [...donorIds].sort((a,b) => {
+      const clA = CLEANERS.find(c=>c.id===a); const clB = CLEANERS.find(c=>c.id===b);
+      const scoreA = (needMaleOnTarget && clA?.gender==='m') || (needFemaleOnTarget && clA?.gender==='f') ? 0 : 1;
+      const scoreB = (needMaleOnTarget && clB?.gender==='m') || (needFemaleOnTarget && clB?.gender==='f') ? 0 : 1;
+      if(scoreA !== scoreB) return scoreA - scoreB;
+      return (getCleanerTrainingBreadth(clB)||0) - (getCleanerTrainingBreadth(clA)||0);
+    });
+    const combos = [];
+    const gen = (start, current) => {
+      if(combos.length >= MAX_DONOR_COMBINATIONS) return;
+      if(current.length === releaseCount) { combos.push([...current]); return; }
+      // FIX 10: iterate over sorted, not donorIds
+      for(let i=start; i<sorted.length; i++){
+        current.push(sorted[i]);
+        gen(i+1, current);
+        current.pop();
+      }
+    };
+    gen(0, []);
+    return combos.map(releasedIds => ({
+      releasedIds,
+      keepIds: sorted.filter(id => !releasedIds.includes(id)),
+    }));
+  };
+
+  // ── Main simulation loop ──────────────────────────────────────────────────
+  const suggestions = [];
+  const seenSuggestionKeys = new Set();
+
+  for(const donor of donorJobs){
+    const fbConfig     = getCheckoutFallbackConfig(donor);
+    const donorIds     = dedupeCleanerIds(donor.cleanerIds);
+    const donorGenReq  = getJobGenderRequirement(donor);
+    const donorOriginalWorkerHours = donorIds.length * getJobDuration(donor); // FIX 9
+
+    for(const target of targetJobs){
+      if(target.id === donor.id) continue;
+      const targetOrigIds    = dedupeCleanerIds(target.cleanerIds);
+      const targetRequired   = getJobRequiredCleaners(target);
+      const targetGenReq     = getJobGenderRequirement(target);
+      const origMissingCount = Math.max(0, targetRequired - targetOrigIds.length);
+      const origGenderOk     = genderRequirementMet(target, targetOrigIds);
+      // FIX 5: compute missing slots to cap selection
+      const missingSlots     = Math.max(0, targetRequired - targetOrigIds.length);
+      const existingHaveM    = targetOrigIds.filter(id=>(CLEANERS.find(c=>c.id===id)||{}).gender==='m').length;
+      const existingHaveF    = targetOrigIds.filter(id=>(CLEANERS.find(c=>c.id===id)||{}).gender==='f').length;
+      const needMale   = Math.max(0, Number(targetGenReq.male)   - existingHaveM);
+      const needFemale = Math.max(0, Number(targetGenReq.female) - existingHaveF);
+
+      const combos = getReleaseCombinations(donorIds, fbConfig.cleaners, target);
+
+      for(const { releasedIds, keepIds } of combos){
+        diagnostics.simulationsTried++;
+
+        // FIX 10: stable key using pre-sorted copy
+        const sortedReleasedIds = [...releasedIds].sort();
+
+        // ── FIX 8: Full donor validation after fallback conversion ───────────
+        // Build a tentative simulated jobs list with donor removed (cleaner hours excluded)
+        const simJobsNoDonor = jobs.filter(j=>j.id!==donor.id);
+        // Check every keepId cleaner is still valid for the fallback donor slot
+        const donorKeepCleaners = keepIds.map(id=>CLEANERS.find(c=>c.id===id)).filter(Boolean);
+        if(donorKeepCleaners.length !== fbConfig.cleaners) continue;
+        const simDonor = {
+          ...donor,
+          cleanerIds: keepIds,
+          cleanersRequired: fbConfig.cleaners,
+          duration: fbConfig.duration,
+          fallbackUsed: true,
+          fallbackOriginalCleanersRequired: getJobRequiredCleaners(donor),
+          fallbackOriginalDuration: getJobDuration(donor),
+        };
+        if(!genderRequirementMet(simDonor, keepIds)) continue;
+        const simJobsWithFallbackDonor = [...simJobsNoDonor, simDonor];
+        // Validate each keeper against the fallback slot
+        let donorInvalid = false;
+        for(const cl of donorKeepCleaners){
+          if(!isDonorCleanerValidForFallback(cl, simDonor, fbConfig, simJobsNoDonor)){
+            donorInvalid = true; break;
+          }
+        }
+        if(donorInvalid) continue;
+
+        // ── FIX 4: All released cleaners must go to target; none disappear ───
+        const releasedCleaners = releasedIds.map(id=>CLEANERS.find(c=>c.id===id)).filter(Boolean);
+        // Validate which released cleaners can be added to target using simulated hours
+        const validForTarget = releasedCleaners.filter(cl =>
+          canAddCleanerToTarget(cl, target, simJobsWithFallbackDonor)
+        );
+        // FIX 4: All released cleaners must be placed on the target; if any can't → reject
+        if(validForTarget.length !== releasedCleaners.length) continue;
+        if(validForTarget.length === 0) continue;
+
+        // ── FIX 5: Gender-aware selection capped at missingSlots ─────────────
+        const selectedForTarget = [];
+        const taken = new Set(targetOrigIds);
+        // 1. Required males
+        let mAdded = 0;
+        for(const cl of validForTarget){
+          if(mAdded >= needMale) break;
+          if(cl.gender === 'm' && !taken.has(cl.id)){ selectedForTarget.push(cl); taken.add(cl.id); mAdded++; }
+        }
+        // 2. Required females
+        let fAdded = 0;
+        for(const cl of validForTarget){
+          if(fAdded >= needFemale) break;
+          if(cl.gender === 'f' && !taken.has(cl.id)){ selectedForTarget.push(cl); taken.add(cl.id); fAdded++; }
+        }
+        // 3. Remaining count slots (no partial coverage in 10K-A)
+        const remainingSlots = missingSlots - selectedForTarget.length;
+        for(const cl of validForTarget){
+          if(selectedForTarget.length - (mAdded+fAdded) >= remainingSlots) break;
+          if(!taken.has(cl.id)){ selectedForTarget.push(cl); taken.add(cl.id); }
+        }
+        // FIX 4: selectedForTarget must exactly match all released cleaners
+        if(selectedForTarget.length !== releasedCleaners.length) continue;
+        const actualReleasedIds = selectedForTarget.map(c=>c.id);
+        const donorKeepIds = donorIds.filter(id => !actualReleasedIds.includes(id));
+        if(donorKeepIds.length !== fbConfig.cleaners) continue;
+
+        // Build final simulated state
+        const newTargetIds    = dedupeCleanerIds([...targetOrigIds, ...actualReleasedIds]);
+        const newMissingCount = Math.max(0, targetRequired - newTargetIds.length);
+        const newGenderOk     = genderRequirementMet(target, newTargetIds);
+        const genderFixed     = !origGenderOk && newGenderOk;
+        const fullyFixed      = newTargetIds.length >= targetRequired && newGenderOk;
+        if(newMissingCount >= origMissingCount && !genderFixed) continue;
+
+        const simTarget     = { ...target, cleanerIds: newTargetIds, status: fullyFixed?'assigned':'needs_review' };
+        const simulatedJobs = simJobsWithFallbackDonor.map(j=>j.id===target.id?simTarget:j);
+
+        // ── FIX 6: Real conflict comparison using shared helpers ─────────────
+        const simConflicts = detectConflicts(simulatedJobs);
+        const donorBaseReal   = getRealIssues(baselineConflicts, donor.id);
+        const targetBaseReal  = getRealIssues(baselineConflicts, target.id);
+        const donorSimReal    = getRealIssues(simConflicts, simDonor.id);
+        const targetSimReal   = getRealIssues(simConflicts, simTarget.id);
+        if(donorSimReal.length  > donorBaseReal.length)  continue;
+        if(targetSimReal.length > targetBaseReal.length) continue;
+
+        // ── FIX 7: Check all affected jobs ───────────────────────────────────
+        const affectedCleanerIds = new Set([...actualReleasedIds, ...donorKeepIds]);
+        let affectedJobInvalid = false;
+        for(const affId of affectedCleanerIds){
+          const affJobs = simulatedJobs.filter(j=>(j.cleanerIds||[]).includes(affId) && j.id!==donor.id && j.id!==target.id);
+          for(const aj of affJobs){
+            const baseReal = getRealIssues(baselineConflicts, aj.id);
+            const simReal  = getRealIssues(simConflicts, aj.id);
+            if(simReal.length > baseReal.length){ affectedJobInvalid = true; break; }
+          }
+          if(affectedJobInvalid) break;
+        }
+        if(affectedJobInvalid) continue;
+
+        // ── FIX 5/4: Deduplication key ────────────────────────────────────────
+        const key = `${donor.id}|${target.id}|${sortedReleasedIds.join(',')}`;
+        if(seenSuggestionKeys.has(key)) continue;
+        seenSuggestionKeys.add(key);
+
+        // ── FIX 9: Correct worker-hours calculation ───────────────────────────
+        const donorFallbackWorkerHours     = donorKeepIds.length * fbConfig.duration;
+        const donorAdditionalWorkerHours   = donorFallbackWorkerHours - donorOriginalWorkerHours;
+        const warnings = [];
+        if(donorAdditionalWorkerHours > 0)  warnings.push(`Il fallback aumenta le ore cleaner di ${donorAdditionalWorkerHours}h.`);
+        if(donorAdditionalWorkerHours === 0) warnings.push('Nessuna variazione di ore cleaner sul donor.');
+        if(donorAdditionalWorkerHours < 0)  warnings.push(`Il fallback riduce le ore cleaner di ${Math.abs(donorAdditionalWorkerHours)}h.`);
+        if(!fullyFixed) warnings.push('Il target rimane needs_review dopo la riallocazione.');
+        warnings.push('Decisione supervisore richiesta. Nessuna modifica applicata automaticamente.');
+
+        const donorName      = getJobDisplayName(donor);
+        const targetName     = getJobDisplayName(target);
+        const releasedNames  = selectedForTarget.map(c=>c.name).join(', ');
+        const explanation = [
+          `Converti ${donorName} da ${getJobRequiredCleaners(donor)} cleaners × ${getJobDuration(donor)}h`,
+          `al fallback ${fbConfig.cleaners} cleaners × ${fbConfig.duration}h.`,
+          `Libera ${releasedNames} e assegna${selectedForTarget.length>1?'li':'lo'} a ${targetName}.`,
+          fullyFixed
+            ? `${donorName} resta coperta e ${targetName} passa da needs_review ad assigned.`
+            : `${targetName} migliora (${origMissingCount}→${newMissingCount} slot mancanti${genderFixed?' + gender fix':''}).`,
+        ].join(' ');
+
+        suggestions.push({
+          id: `fr_${donor.id}_${target.id}_${sortedReleasedIds.join('_')}`,
+          type: 'fallback_reallocation',
+          targetJobId: target.id,
+          targetPropertyName: targetName,
+          targetDay: target.day,
+          targetStartTime: target.startTime,
+          donorJobId: donor.id,
+          donorPropertyName: donorName,
+          donorDay: donor.day,
+          donorStartTime: donor.startTime,
+          donorOriginalCleanersRequired: getJobRequiredCleaners(donor),
+          donorFallbackCleanersRequired: fbConfig.cleaners,
+          donorOriginalDuration: getJobDuration(donor),
+          donorFallbackDuration: fbConfig.duration,
+          donorOriginalCleanerIds: donorIds,
+          donorFallbackCleanerIds: donorKeepIds,
+          releasedCleanerIds: actualReleasedIds,
+          releasedCleanerNames: selectedForTarget.map(c=>c.name),
+          targetOriginalCleanerIds: targetOrigIds,
+          targetSuggestedCleanerIds: newTargetIds,
+          targetWasFullyUnassigned: targetOrigIds.length === 0,
+          targetOriginalMissingCount: origMissingCount,
+          targetNewMissingCount: newMissingCount,
+          targetGenderFixed: genderFixed,
+          targetFullyFixed: fullyFixed,
+          donorAdditionalWorkerHours,
+          warnings,
+          explanation,
+          _score: [
+            fullyFixed ? 0 : 1,
+            genderFixed ? 0 : 1,
+            newMissingCount,
+            -selectedForTarget.length,
+            -getJobRequiredCleaners(donor),
+            donorAdditionalWorkerHours,
+            DAYS.indexOf(target.day),
+            t2m(target.startTime),
+            t2m(donor.startTime),
+          ],
+        });
+        diagnostics.validSuggestions++;
+      }
+    }
+  }
+
+  suggestions.sort((a,b) => {
+    for(let i=0; i<a._score.length; i++){
+      if(a._score[i] !== b._score[i]) return a._score[i] - b._score[i];
+    }
+    return (a.donorJobId+a.targetJobId).localeCompare(b.donorJobId+b.targetJobId);
+  });
+  suggestions.forEach(s=>delete s._score);
+  return { suggestions, diagnostics };
+};
+
 const exportWIW = (jobs, weekOffset, conflicts) => {
   const dates = getWeekDates(weekOffset);
   const rows = [['First Name','Last Name','Date','Start Time','End Time','Job Site','Position','Notes','Type']];
@@ -4322,17 +4698,21 @@ function WeekView({jobs,conflicts,weekOffset,onDaySelect,onConflictDay,onLoadTem
   // both into the same Map — so the split uses the shared helpers defined near
   // detectConflicts() (also used by Sidebar, to avoid the two drifting apart).
   const realConflictCount = getRealConflictCount(jobs, conflicts);
-  // issueCount drives the separate "Da rivedere" badge — union of needs_review status
-  // and ANY conflicts entry (including pure staffing/gender ones).
   const issueCount=jobs.filter(j =>
     j.status === 'needs_review' ||
     (conflicts.get(j.id)||[]).length > 0
   ).length;
   const dates=useMemo(()=>getWeekDates(weekOffset),[weekOffset]);
   const today=useMemo(()=>getTodayKey(),[]);
-  const uncovered=useMemo(()=>getUncovered(jobs),[jobs]); // mandatory only (office/restaurant)
+  const uncovered=useMemo(()=>getUncovered(jobs),[jobs]);
   const totalHrs=useMemo(()=>Math.round(jobs.reduce((s,j)=>s+getJobDuration(j),0)*10)/10,[jobs]);
   const unassigned=jobs.filter(j=>j.cleanerIds.length===0).length;
+  // Fix 10K-A: fallback reallocation suggestions (second-pass, read-only analysis)
+  const reallocationResult=useMemo(()=>{
+    if(!wf.shiftsGenerated||wf.staleGeneration||jobs.length===0) return null;
+    return buildFallbackReallocationSuggestions(jobs, weekOffset);
+  },[jobs, weekOffset, wf.shiftsGenerated, wf.staleGeneration]);
+  const [expandedSuggestion,setExpandedSuggestion]=useState(null);
 
   return(
     <div style={{paddingBottom:8}}>
@@ -4343,7 +4723,48 @@ function WeekView({jobs,conflicts,weekOffset,onDaySelect,onConflictDay,onLoadTem
         <StatPill label="Ore pian." value={`${totalHrs}h`} color={C.blue}/>
       </div>
 
-      {/* Action buttons */}
+      {/* Fix 10K-A: Fallback reallocation suggestions — read-only, no auto-apply */}
+      {reallocationResult?.suggestions?.length>0&&(
+        <div style={{background:'#F0F7FF',border:'1px solid #BFDBFE',borderRadius:12,padding:'12px 14px',marginBottom:14}}>
+          <div style={{fontSize:13,fontWeight:800,color:'#1D4ED8',marginBottom:8}}>
+            🔄 Riallocazioni fallback possibili ({reallocationResult.suggestions.length})
+          </div>
+          {reallocationResult.suggestions.slice(0,5).map((s,i)=>(
+            <div key={s.id} style={{background:'white',borderRadius:10,padding:'10px 12px',marginBottom:8,border:'1px solid #DBEAFE'}}>
+              <div style={{fontSize:12,fontWeight:700,color:C.text,marginBottom:4}}>
+                {s.targetFullyFixed?'✅':'⚠️'} {s.targetPropertyName}
+                <span style={{marginLeft:6,fontSize:10,color:C.muted,fontWeight:400}}>{s.targetDay} {s.targetStartTime}</span>
+              </div>
+              <div style={{fontSize:11,color:'#374151',lineHeight:1.5,marginBottom:6}}>{s.explanation}</div>
+              {expandedSuggestion===s.id&&(
+                <div style={{background:'#F8FAFF',borderRadius:8,padding:'8px 10px',marginBottom:6,fontSize:10,color:'#4B5563'}}>
+                  <div><b>Donor:</b> {s.donorPropertyName} {s.donorDay} {s.donorStartTime}</div>
+                  <div><b>Normale:</b> {s.donorOriginalCleanersRequired}cl × {s.donorOriginalDuration}h → <b>Fallback:</b> {s.donorFallbackCleanersRequired}cl × {s.donorFallbackDuration}h</div>
+                  <div><b>Liberati:</b> {s.releasedCleanerNames.join(', ')}</div>
+                  <div><b>Target dopo:</b> {s.targetOriginalMissingCount}→{s.targetNewMissingCount} slot mancanti{s.targetGenderFixed?' + gender risolto':''}</div>
+                  {s.warnings.filter(w=>!w.includes('Decisione supervisore')).map((w,wi)=>(
+                    <div key={wi} style={{color:C.warn,marginTop:2}}>⚠ {w}</div>
+                  ))}
+                  <div style={{marginTop:4,color:'#6B7280',fontStyle:'italic'}}>{s.warnings.find(w=>w.includes('Decisione supervisore'))}</div>
+                </div>
+              )}
+              <div style={{display:'flex',gap:6}}>
+                <button onClick={()=>setExpandedSuggestion(expandedSuggestion===s.id?null:s.id)}
+                  style={{padding:'5px 10px',borderRadius:7,fontSize:11,fontWeight:700,border:'1px solid #BFDBFE',background:'white',color:'#1D4ED8',cursor:'pointer',fontFamily:'inherit'}}>
+                  {expandedSuggestion===s.id?'Nascondi':'Vedi dettaglio'}
+                </button>
+                <button disabled title="Applicazione automatica disponibile nel prossimo step"
+                  style={{padding:'5px 10px',borderRadius:7,fontSize:11,fontWeight:600,border:'1px solid #E5E7EB',background:'#F9FAFB',color:'#9CA3AF',cursor:'not-allowed',fontFamily:'inherit'}}>
+                  Applicazione automatica disponibile nel prossimo step
+                </button>
+              </div>
+            </div>
+          ))}
+          {reallocationResult.suggestions.length>5&&<div style={{fontSize:11,color:C.muted,marginTop:4}}>
+            + altri {reallocationResult.suggestions.length-5} suggerimenti (migliori 5 mostrati)
+          </div>}
+        </div>
+      )}
       <div style={{display:'flex',gap:8,marginBottom:14}}>
         <button onClick={onLoadTemplate} style={{flex:1,display:'flex',alignItems:'center',gap:8,background:C.card,borderRadius:12,padding:'11px 14px',border:'1.5px solid #86EFAC',cursor:'pointer',fontFamily:'inherit',textAlign:'left'}}>
           <span style={{fontSize:18}}>📊</span>
@@ -4969,7 +5390,7 @@ function JobForm({initial,onSave,onDelete}){
   const trained=form.propertyId?CLEANERS.filter(c=>TRAINING[c.id]?.includes(form.propertyId)):CLEANERS;
   const required=prop?.cleanersRequired||(prop?.requires2?2:1);
   const needsMore=form.cleanerIds.length>0&&form.cleanerIds.length<required;
-  const canSave=form.propertyId&&form.cleanerIds.length>0&&!needsMore;
+  const canSave=!!form.propertyId&&form.cleanerIds.length>0;
   const toggle=id=>setForm(f=>({...f,cleanerIds:f.cleanerIds.includes(id)?f.cleanerIds.filter(x=>x!==id):[...f.cleanerIds,id]}));
   const isEdit=!!(initial?.propertyId);
 
