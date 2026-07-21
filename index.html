@@ -11697,8 +11697,12 @@ function App(){
     clearDraft(weekStartISO);
     clearPendingOverwriteWarning(weekStartISO);
     saveLastMinuteJobs(jobs, weekOffset);
-    const hhmm = new Date(result.publishedAt).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
-    showToast(`✓ Turni pubblicati alle ${hhmm} — visibili su altri dispositivi`);
+   const hhmm = new Date(result.publishedAt).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
+    if(!publishValidation.ok){
+      showToast(`✓ Piano parziale pubblicato alle ${hhmm} — ${publishValidation.blockingCount} conflitti ancora da risolvere`);
+    } else {
+      showToast(`✓ Turni pubblicati alle ${hhmm} — visibili su altri dispositivi`);
+    }
     } catch(e) {
       console.error('[publishCurrentSchedule] Failed', e);
       showToast('Errore pubblicazione: ' + String(e.message||e), 'error');
