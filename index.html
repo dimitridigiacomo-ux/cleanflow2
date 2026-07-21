@@ -6590,11 +6590,6 @@ const guardScheduleHardValidationOrBlock = (jobs, weekOffset, showToast) => {
   if(showToast) showToast(`Bloccato: ${hv.blockingCount} conflitti bloccanti`,'error');
   return false;
 };
-...
-    if(showToast) showToast(`Bloccato: ${hv.blockingCount} conflitti bloccanti`,'error');
-    return false;
-  };
-                                                          ← riga 6593, qui
   // ── URGENT FIX — PUBLISH VALIDATION WARNING (read-only, non-blocking) ────────
   // Used ONLY by publishCurrentSchedule, to fold a strong conflict warning into the SAME
   // confirm() dialog already shown before publishing — never a separate alert() first.
