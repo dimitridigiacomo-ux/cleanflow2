@@ -6610,11 +6610,7 @@ const guardScheduleHardValidationOrBlock = (jobs, weekOffset, showToast) => {
       `\n\nPuoi comunque salvarlo e pubblicarlo come stato di lavoro parziale.\n`+
       `Il piano sarà visibile dagli altri dispositivi e potrà essere completato successivamente.\n\n`;
   };
-
-  // ── URGENT MICRO-FIX — WARNING + OVERRIDE EXPORT GATE ─────────────────────
-  // Used by Supervisor export (both buttons)...
-  const confirmScheduleExportDespiteBlockingIssues = (jobs, weekOffset, showToast, exportLabel='Supervisor') => {
-  ...
+  
 // ── URGENT MICRO-FIX — WARNING + OVERRIDE EXPORT GATE ────────────────────────
 // Used by Supervisor export (both buttons) and folded into the WIW modal's existing
 // conflict-confirmation flow. Unlike guardScheduleHardValidationOrBlock (hard stop,
