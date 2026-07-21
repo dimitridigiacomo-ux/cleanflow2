@@ -11599,22 +11599,24 @@ function App(){
     publishingRef.current = true;
     let publishingStarted = false;
     try {
-    if(blockIfWeekMismatch()) return;
+   if(blockIfWeekMismatch()) return;
     if(publishing) return;
     if(jobs.length===0){ showToast('Nessun turno da pubblicare','warn'); return; }
-
-    // EMERGENCY PATCH — hard gate (MICRO-CORRECTION #4). Never trust a stale
-    // hardValidation computed at generation time: the supervisor may have edited the
-    // plan manually (or reassigned cleaners) since then, so this is always recalculated
-    // against the CURRENT jobs/constraints right before publish.
-    if(!guardScheduleHardValidationOrBlock(jobs, weekOffset, showToast)) return;
-
+    // URGENT FIX — Publish must never be technically blocked by conflicts: it also
+    // serves as the shared cross-device save. validateFinalScheduleHardConstraints
+    // itself is UNCHANGED — still the single source of truth for diagnosing problems —
+    // it is now used READ-ONLY to build a strong warning inside the same confirm()
+    // dialog below, instead of returning early. Never trust a stale hardValidation
+    // computed at generation time: the supervisor may have edited the plan manually
+    // (or reassigned cleaners) since then, so this is always recalculated against the
+    // CURRENT jobs/constraints right before publish.
+    const currentConstraints = buildConstraints(weekOffset);
+    const publishValidation = validateFinalScheduleHardConstraints(jobs, currentConstraints);
     const bypassOverwriteModal = skipOverwriteModal === true;
     if(serverVersionChanged && !bypassOverwriteModal){
       setModal('overwriteDiff');
       return;
     }
-
     let supervisorName = getSupervisorName();
     if(!supervisorName){
       const entered = prompt('Il tuo nome supervisor (apparirà sul piano pubblicato):', '');
@@ -11626,7 +11628,6 @@ function App(){
       setSupervisorName(supervisorName);
       setSupervisorNameUI(supervisorName);
     }
-
     const issueCount = jobs.filter(j => (conflicts && conflicts.has && conflicts.has(j.id)) || j.status==='needs_review').length;
     const unassignedCount = jobs.filter(j => (j.cleanerIds||[]).length===0).length;
     const overwriteWarning = serverVersionChanged
@@ -11634,8 +11635,11 @@ function App(){
         `Se continui, SOVRASCRIVI la loro versione più recente con la tua.\n`+
         `Controlla di non perdere modifiche altrui prima di procedere.\n\n`
       : '';
+    // Single combined warning — never a separate alert() before this confirm().
+    const publishValidationWarning = buildPublishValidationWarning(publishValidation);
     const confirmMsg =
       overwriteWarning +
+      publishValidationWarning +
       `Stai pubblicando il piano della settimana ${fmtWeek(weekOffset)}.\n`+
       `Turni: ${jobs.length}\n`+
       `Da rivedere/conflitti: ${issueCount}\n`+
