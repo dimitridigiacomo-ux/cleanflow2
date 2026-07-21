@@ -6590,7 +6590,36 @@ const guardScheduleHardValidationOrBlock = (jobs, weekOffset, showToast) => {
   if(showToast) showToast(`Bloccato: ${hv.blockingCount} conflitti bloccanti`,'error');
   return false;
 };
+...
+    if(showToast) showToast(`Bloccato: ${hv.blockingCount} conflitti bloccanti`,'error');
+    return false;
+  };
+                                                          ← riga 6593, qui
+  // ── URGENT FIX — PUBLISH VALIDATION WARNING (read-only, non-blocking) ────────
+  // Used ONLY by publishCurrentSchedule, to fold a strong conflict warning into the SAME
+  // confirm() dialog already shown before publishing — never a separate alert() first.
+  // validateFinalScheduleHardConstraints itself is never modified by this: it stays the
+  // single source of truth for diagnosing problems (also used for export/debug/future
+  // checks). This helper only turns its result into display text; it never blocks
+  // anything and never mutates jobs/constraints. Returns '' when the plan has no
+  // blocking issues, so it can always be safely prepended to the existing confirm text.
+  const buildPublishValidationWarning = validation => {
+    if(!validation || validation.ok) return '';
+    const preview = validation.blocking.slice(0,6).map(b=>{
+      const cleanerName = b.cleanerName || (b.cId ? CLEANERS.find(c=>c.id===b.cId)?.name : '') || '';
+      const propName = b.propertyId ? (PROPERTIES.find(p=>p.id===b.propertyId)?.name||b.propertyId) : '';
+      return '• '+[cleanerName, propName, b.day, b.type].filter(Boolean).join(' — ');
+    }).join('\n');
+    return `⚠️ ATTENZIONE: il piano contiene ${validation.blockingCount} conflitti operativi ancora da risolvere.\n`+
+      preview + (validation.blockingCount>6?`\n… e altri ${validation.blockingCount-6}`:'') +
+      `\n\nPuoi comunque salvarlo e pubblicarlo come stato di lavoro parziale.\n`+
+      `Il piano sarà visibile dagli altri dispositivi e potrà essere completato successivamente.\n\n`;
+  };
 
+  // ── URGENT MICRO-FIX — WARNING + OVERRIDE EXPORT GATE ─────────────────────
+  // Used by Supervisor export (both buttons)...
+  const confirmScheduleExportDespiteBlockingIssues = (jobs, weekOffset, showToast, exportLabel='Supervisor') => {
+  ...
 // ── URGENT MICRO-FIX — WARNING + OVERRIDE EXPORT GATE ────────────────────────
 // Used by Supervisor export (both buttons) and folded into the WIW modal's existing
 // conflict-confirmation flow. Unlike guardScheduleHardValidationOrBlock (hard stop,
