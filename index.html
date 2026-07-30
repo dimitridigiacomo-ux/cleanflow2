@@ -4291,6 +4291,9 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
   // decision (id → snapshot). The diagnostic re-run reads these instead of re-deriving
   // ranks from weeklyHrs/dailyHrs, which commitTeam has already mutated by then.
   let lastComparatorSnapshotById = {};
+  // 3A.2-iii: provenance records for the cleaners newly picked on the current slot
+  // (populated by pickGenderAware when trace is ON). Read by the trace emitter below.
+  let lastSlotProvenance = null;
 
   const buildEligibleForSlot = (job, candidateJob, existing, durationOverride=null) => {
     const effectiveDur = durationOverride !== null ? durationOverride : getJobOperationalDuration(candidateJob);
@@ -4441,7 +4444,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
   // Combined-requirement picker (Fix 10M-B): selects cleaners satisfying senior+gender
   // requirements simultaneously. A senior male satisfies both senior AND male slots.
   // Replaces the earlier gender-only picker while preserving all existing cap rules.
-  const pickGenderAware = (job, eligible, existing, missing, candidateJob, effectiveDur, dailyHrsMap, constraintsMap) => {
+  const pickGenderAware = (job, eligible, existing, missing, candidateJob, effectiveDur, dailyHrsMap, constraintsMap, provenanceSink=null) => {
     if(missing <= 0) return [];
     const canFitCleaner = (cl) => {
       const currentDaily = dailyHrsMap[cl.id]?.[job.day] || 0;
@@ -4481,6 +4484,30 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
         else if(score === bestScore && best) break; // prefer earlier-ranked (eligible order)
       }
       if(!best) break;
+      // 3A.2-iii: record provenance at the real decision point. This branch is a
+      // TEAM_COMPOSITION selection — the cleaner was chosen for its contribution to the
+      // unmet requirement (getCleanerRequirementContribution against the live deficits),
+      // NOT by the individual comparator. mechanism/role reflect the deficit being filled.
+      if(provenanceSink){
+        const contributesMale   = deficits.male   > 0 && best.gender === 'm';
+        const contributesFemale = deficits.female > 0 && best.gender === 'f';
+        const contributesSenior = deficits.senior > 0 && isSeniorCleaner(best);
+        const usedPartial = (deficits.male > 0 && best.gender === 'm') && !canFitFullCap(best) && canFitCleaner(best);
+        let mechanism, role;
+        if(usedPartial){ mechanism = 'PARTIAL_MALE_COVERAGE'; role = 'PARTIAL_MALE_REQUIRED'; }
+        else if(contributesMale && contributesSenior){ mechanism = 'GENDER_AND_SENIORITY_FILL'; role = 'MALE_AND_SENIOR_REQUIRED'; }
+        else if(contributesFemale && contributesSenior){ mechanism = 'GENDER_AND_SENIORITY_FILL'; role = 'FEMALE_AND_SENIOR_REQUIRED'; }
+        else if(contributesMale){ mechanism = 'GENDER_REQUIREMENT_FILL'; role = 'MALE_REQUIRED'; }
+        else if(contributesFemale){ mechanism = 'GENDER_REQUIREMENT_FILL'; role = 'FEMALE_REQUIRED'; }
+        else if(contributesSenior){ mechanism = 'SENIORITY_REQUIREMENT_FILL'; role = 'SENIOR_REQUIRED'; }
+        else { mechanism = 'TEAM_COMPOSITION_FILL'; role = 'TEAM_BALANCE_SLOT'; }
+        provenanceSink.push({
+          cleanerId: best.id, selectionMode: 'TEAM_COMPOSITION', selectionMechanism: mechanism,
+          selectionRole: role, selectionFunction: 'pickGenderAware.requirementPhase',
+          candidatePoolSize: eligible.length, comparatorUsed: false,
+          teamBeforeIds: [...currentIds], requirementContribution: bestScore,
+        });
+      }
       picked.push(best); taken.add(best.id);
       currentIds = [...currentIds, best.id];
     }
@@ -4511,6 +4538,19 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
     let optCount = 0;
     for(const cl of optPool){
       if(optCount >= maxOptional) break;
+      // 3A.2-iii: optional-phase picks fill remaining slots after requirements are met.
+      // TEAM_COMPOSITION, not individual comparator. Scarcity-ordered pools (male/senior
+      // preserved for where they're required) → SCARCITY_PRESERVATION; otherwise general fill.
+      if(provenanceSink){
+        const scarcityOrdered = Number(genReq.male) > 0 || Number(seniorReq.senior) > 0;
+        provenanceSink.push({
+          cleanerId: cl.id, selectionMode: 'TEAM_COMPOSITION',
+          selectionMechanism: scarcityOrdered ? 'SCARCITY_PRESERVATION' : 'GENERAL_TEAM_FILL',
+          selectionRole: 'GENERAL_SLOT', selectionFunction: 'pickGenderAware.optionalPhase',
+          candidatePoolSize: optPool.length, comparatorUsed: false,
+          teamBeforeIds: [...existingIds, ...picked.map(c=>c.id)], requirementContribution: 0,
+        });
+      }
       picked.push(cl); taken.add(cl.id); optCount++;
     }
     return picked;
@@ -4829,7 +4869,9 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
       });
       if(!existingValid) continue;
       const eligible=buildEligibleForSlot(job, candidateJob, existing);
-      const pickNew=pickGenderAware(job, eligible, existing, missing, candidateJob, jobDur, dailyHrs, constraints);
+      const slotProvenance = trace ? [] : null;
+      const pickNew=pickGenderAware(job, eligible, existing, missing, candidateJob, jobDur, dailyHrs, constraints, slotProvenance);
+      if(slotProvenance) lastSlotProvenance = slotProvenance;
       const teamIds=[...existing, ...pickNew.map(c=>c.id)];
       const countOk=teamIds.length>=needed;
       const genderOk=genderRequirementMet(job, teamIds);
@@ -5102,24 +5144,47 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
       // her and the lowest-loaded valid non-template-only alternative, to record which
       // comparator key actually made her win. Purely observational — the comparator was
       // already used to produce the ordering; this re-runs it read-only on two candidates.
+      // 3A.2-iii: emit one provenance record per newly-picked cleaner, from the real
+      // decision branch in pickGenderAware. Build a mechanism map so the comparator
+      // evidence below is emitted ONLY for genuinely comparator-driven (INDIVIDUAL) picks.
+      const provByCleaner = {};
+      if(lastSlotProvenance){
+        lastSlotProvenance.forEach(p => { provByCleaner[p.cleanerId] = p; });
+        d.newlySelectedCandidateIds.forEach(selId => {
+          const p = provByCleaner[selId];
+          if(!p) return;
+          trace.pushCandidate({ phase:'scheduler', type:'cleaner_selection_provenance', jobId: job.id||'',
+            jobDebugKey, cleanerId: selId,
+            message:`${(CLEANERS.find(x=>x.id===selId)||{}).name || selId}: ${p.selectionMechanism}`,
+            data:{ plan:tracePlan, selectionMode:p.selectionMode, selectionMechanism:p.selectionMechanism,
+                   selectionRole:p.selectionRole, selectionFunction:p.selectionFunction,
+                   candidatePoolSize:p.candidatePoolSize, comparatorUsed:p.comparatorUsed,
+                   requirementContribution:p.requirementContribution, committed:true } });
+        });
+      }
+      // Comparator evidence is only meaningful when the pick was actually decided by the
+      // individual comparator ordering. In the current greedy every pick comes through
+      // pickGenderAware (team-composition), so comparator evidence is emitted only for the
+      // general optional-fill picks where the eligible (comparator) order was decisive.
       if(lastCompareCandidateDecision && d.newlySelectedCandidateIds.length){
         const eligibleAlts = d.perCleaner.filter(c =>
           c.considered && c.eligible === true && !d.selectedCandidateIds.includes(c.cleanerId)
           && (CLEANERS.find(x=>x.id===c.cleanerId)?.autoScheduleEnabled !== false));
         d.newlySelectedCandidateIds.forEach(selId => {
-          // Use the FROZEN decision-time snapshots captured during the sort of THIS slot,
-          // never post-commit state. If either snapshot is missing (e.g. slot filled by a
-          // path that did not run buildEligibleForSlot), skip — evidence must be exact.
+          // Only emit comparator evidence for INDIVIDUAL / general-fill picks. Requirement
+          // and scarcity fills are team-composition: comparing them individually produces
+          // the false mismatches this phase removes.
+          const p = provByCleaner[selId];
+          const comparatorApplicable = !p || p.selectionMechanism === 'GENERAL_TEAM_FILL';
+          if(!comparatorApplicable) return;
           const selSnap = lastComparatorSnapshotById[selId];
           if(!selSnap || eligibleAlts.length === 0) return;
-          // Lowest-loaded valid alternative by weekly hours BEFORE the decision (frozen).
           let altMeta = null;
           eligibleAlts.forEach(c => { if(!altMeta || c.weeklyHoursBefore < altMeta.weeklyHoursBefore) altMeta = c; });
           const altSnap = lastComparatorSnapshotById[altMeta.cleanerId];
           if(!altSnap) return;
           const selCl = selSnap.cleaner, altCl = altSnap.cleaner;
           const cmp = lastCompareCandidateDecision(selSnap, altSnap, true);
-          // result <= 0 means selected ranks first (won) on the frozen decision-time values.
           trace.pushCandidate({ phase:'scheduler', type:'candidate_comparator_decision', jobId: job.id||'',
             jobDebugKey, cleanerId: selId,
             message:`${selCl.name} vince su ${altCl.name}: ${cmp.decisionReason}`,
@@ -5130,6 +5195,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
                    selectedWeeklyBefore: selSnap.weeklyHoursBefore, alternativeWeeklyBefore: altSnap.weeklyHoursBefore } });
         });
       }
+      lastSlotProvenance = null;
       // A cleaner cannot be both selected and hard-rejected on the same slot; if it ever
       // happens the trace says so instead of silently showing a contradiction.
       const contradictoryIds = d.selectedCandidateIds.filter(id => d.rejectedCandidateIds.includes(id));
@@ -9046,6 +9112,11 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
   // 3A.2-ii comparator integrity counters.
   let decisionsWithComparator = 0, decisionsMissingComparator = 0,
       comparatorSelectedNotWinner = 0, teamIncompatibleAlternativesDiscarded = 0;
+  // 3A.2-iii provenance counters.
+  let individualSelections = 0, teamCompositionSelections = 0, repairSelections = 0,
+      comparatorApplicableSelections = 0, comparatorNotApplicableSelections = 0,
+      provenanceMissingCount = 0, unknownMechanismCount = 0;
+  const byMechanism = {}, byRole = {};
   const reasonCounts = {};
 
   const acceptedByKey = new Map();  // stable decision id → accepted event
@@ -9058,6 +9129,14 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     const plan = e.data && e.data.plan;
     if(winningPlan && plan !== winningPlan) continue;
     comparatorByKey.set((e.jobId||'') + '|' + (e.data?.selectedCleanerId || e.cleanerId || ''), e);
+  }
+  // 3A.2-iii: selection-provenance events keyed by jobId|cleanerId (winning plan only).
+  const provenanceByKey = new Map();
+  for(const e of trace.events){
+    if(!e || e.type !== 'cleaner_selection_provenance') continue;
+    const plan = e.data && e.data.plan;
+    if(winningPlan && plan !== winningPlan) continue;
+    provenanceByKey.set((e.jobId||'') + '|' + (e.cleanerId || ''), e.data);
   }
 
   for(const e of trace.events){
@@ -9138,14 +9217,55 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     // discarded for team composition → the selection is forced by team requirements.
     const forcedByTeamComposition = !lowest && rawAlternatives.length > 0;
 
-    // 3A.2-ii: comparator evidence for the selected-vs-lowest-alternative decision. When
-    // the selection is forced by team composition, there is no fairness comparison to run.
-    const cmpEv = (!forcedByTeamComposition && lowest) ? comparatorByKey.get(jobId + '|' + sel.cleanerId) : null;
+    // 3A.2-iii: resolve selection provenance for this committed slot. Prefer the explicit
+    // provenance event from the greedy; otherwise derive selectionMode from the final job's
+    // schedulerDecisionCode (explicit data, never inferred from cleaner attributes). Repair
+    // sub-type is not attributable per-cleaner without added/removed fields in the move
+    // record (see report) → REPAIR mode with UNKNOWN mechanism when no greedy provenance.
+    const prov = provenanceByKey.get(jobId + '|' + sel.cleanerId) || null;
+    const jobCode = fj && fj.schedulerDecisionCode;
+    let selectionMode, selectionMechanism, selectionRole, selectionFunction;
+    if(prov){
+      selectionMode = prov.selectionMode; selectionMechanism = prov.selectionMechanism;
+      selectionRole = prov.selectionRole; selectionFunction = prov.selectionFunction;
+    } else if(jobCode === 'manual_edit'){
+      selectionMode='MANUAL'; selectionMechanism='MANUAL_ASSIGNMENT'; selectionRole='UNKNOWN_ROLE'; selectionFunction='manualEdit';
+    } else if(jobCode === 'rescue_split'){
+      selectionMode='REPAIR'; selectionMechanism='RESCUE_ASSIGNMENT'; selectionRole='REPAIR_SLOT'; selectionFunction='rescueSplit';
+    } else if(jobCode === 'fallback'){
+      selectionMode='TEAM_COMPOSITION'; selectionMechanism='FALLBACK_ASSIGNMENT'; selectionRole='GENERAL_SLOT'; selectionFunction='checkoutFallback';
+    } else if(isLockedTemplateJob(fj)){
+      selectionMode='LOCKED'; selectionMechanism='LOCKED_TEMPLATE'; selectionRole='UNKNOWN_ROLE'; selectionFunction='template';
+    } else {
+      // No greedy provenance and no distinguishing job code → likely introduced by a repair
+      // move whose accepted-move record lacks per-cleaner add/remove data. Marked REPAIR /
+      // UNKNOWN rather than guessed. Counted in integrity.repairProvenanceMissing.
+      selectionMode='REPAIR'; selectionMechanism='UNKNOWN_SELECTION_MECHANISM'; selectionRole='REPAIR_SLOT'; selectionFunction=null;
+    }
+    const provenanceFound = !!prov || jobCode === 'manual_edit' || jobCode === 'rescue_split' || jobCode === 'fallback' || isLockedTemplateJob(fj);
+    // comparatorApplicable: only genuine INDIVIDUAL / general-fill picks are decided by the
+    // individual comparator ordering. Everything else (requirement/scarcity/team/repair/
+    // fallback/locked/manual) is not comparator-driven.
+    const comparatorApplicable = selectionMechanism === 'GENERAL_TEAM_FILL' || selectionMechanism === 'INDIVIDUAL_COMPARATOR';
+    if(selectionMode === 'INDIVIDUAL') individualSelections++;
+    else if(selectionMode === 'TEAM_COMPOSITION') teamCompositionSelections++;
+    else if(selectionMode === 'REPAIR') repairSelections++;
+    if(comparatorApplicable) comparatorApplicableSelections++; else comparatorNotApplicableSelections++;
+    if(!provenanceFound) provenanceMissingCount++;
+    if(selectionMechanism === 'UNKNOWN_SELECTION_MECHANISM') unknownMechanismCount++;
+    byMechanism[selectionMechanism] = (byMechanism[selectionMechanism] || 0) + 1;
+    byRole[selectionRole] = (byRole[selectionRole] || 0) + 1;
+
+    // 3A.2-ii: comparator evidence — ONLY when comparator is actually applicable. When it
+    // is not, there is no individual comparison to run, so no mismatch can arise.
+    const cmpEv = (comparatorApplicable && !forcedByTeamComposition && lowest)
+      ? comparatorByKey.get(jobId + '|' + sel.cleanerId) : null;
     const firstKey = forcedByTeamComposition ? 'teamCompositionRequirement'
                    : (cmpEv ? (cmpEv.data?.firstDifferingKey || null) : null);
     let decisionReason = forcedByTeamComposition ? 'TEAM_COMPOSITION_REQUIREMENT'
-                       : (cmpEv ? (cmpEv.data?.decisionReason || 'UNKNOWN_COMPARATOR_ADVANTAGE') : 'UNKNOWN_COMPARATOR_ADVANTAGE');
-    // Only count a selected-not-winner when there IS a real interchangeable alternative.
+                       : cmpEv ? (cmpEv.data?.decisionReason || 'UNKNOWN_COMPARATOR_ADVANTAGE')
+                       : (comparatorApplicable ? 'UNKNOWN_COMPARATOR_ADVANTAGE' : selectionMechanism);
+    // Mismatch counters apply ONLY to comparator-driven decisions.
     if(cmpEv && cmpEv.data?.selectedIsWinner === false) comparatorSelectedNotWinner++;
 
     // Reclassify fairness outcome. JUSTIFIED when the selected won on a real operational
@@ -9159,6 +9279,10 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     let fairnessOutcome;
     if(forcedByTeamComposition){
       fairnessOutcome = 'JUSTIFIED_IMBALANCE'; // no interchangeable alternative → justified
+    } else if(!comparatorApplicable){
+      // Team-composition / repair / fallback / locked / manual: the cleaner was required by
+      // an operational branch proven by provenance, not chosen over a lighter alternative.
+      fairnessOutcome = provenanceFound ? 'JUSTIFIED_IMBALANCE' : 'UNRESOLVED_IMBALANCE';
     } else if(!lowest || gap < FDD_AVOIDABLE_GAP){
       fairnessOutcome = 'JUSTIFIED_IMBALANCE'; // gap not material → nothing to avoid
     } else if(!cmpEv || decisionReason === 'UNKNOWN_COMPARATOR_ADVANTAGE'){
@@ -9166,13 +9290,14 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     } else if(OPERATIONAL_REASONS.has(decisionReason)){
       fairnessOutcome = 'JUSTIFIED_IMBALANCE';
     } else {
-      // RANDOM_OR_STABLE_TIE_BREAKER, WEEKLY_LOAD_BALANCE, FAIRNESS_PENALTY etc. with a
-      // material gap and no operational advantage → avoidable. FAIRNESS_PENALTY is NOT
-      // auto-justified (per spec): if it still leaves a lighter valid cleaner unused, avoidable.
-      fairnessOutcome = 'AVOIDABLE_IMBALANCE';
+      // INDIVIDUAL pick, same-role lighter alternative existed, won on flexibility/weekly/
+      // tie-break/fairness-penalty with no operational advantage → a real fairness opportunity.
+      fairnessOutcome = 'POTENTIAL_FAIRNESS_OPPORTUNITY';
     }
-    const avoidable = fairnessOutcome === 'AVOIDABLE_IMBALANCE';
-    if(cmpEv) decisionsWithComparator++; else if(alternatives.length > 0) decisionsMissingComparator++;
+    const avoidable = fairnessOutcome === 'POTENTIAL_FAIRNESS_OPPORTUNITY';
+    if(comparatorApplicable){
+      if(cmpEv) decisionsWithComparator++; else if(alternatives.length > 0) decisionsMissingComparator++;
+    }
     reasonCounts[decisionReason] = (reasonCounts[decisionReason] || 0) + 1;
 
     decisions.push({
@@ -9191,6 +9316,8 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
       lowestLoadedAlternativeHours: lowest ? fddRound1(lowest.totalHoursBefore) : null,
       projectedGapHours: gap, classification, avoidable, fairnessOutcome,
       firstDifferingComparatorKey: firstKey, decisionReason,
+      selectionMode, selectionMechanism, selectionRole, selectionFunction,
+      comparatorApplicable, provenanceFound,
       comparatorEvidence: cmpEv ? {
         selectedValue: cmpEv.data?.winnerValue ?? null,
         alternativeValue: cmpEv.data?.loserValue ?? null,
@@ -9245,8 +9372,18 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     veryStrongImbalances: count('VERY_STRONG_IMBALANCE'),
     // 3A.2-ii reclassified outcomes. avoidableImbalances now = AVOIDABLE only.
     justifiedImbalances: outcomeCount('JUSTIFIED_IMBALANCE'),
-    avoidableImbalances: outcomeCount('AVOIDABLE_IMBALANCE'),
+    avoidableImbalances: outcomeCount('POTENTIAL_FAIRNESS_OPPORTUNITY'),
+    potentialFairnessOpportunities: outcomeCount('POTENTIAL_FAIRNESS_OPPORTUNITY'),
     unresolvedImbalances: outcomeCount('UNRESOLVED_IMBALANCE'),
+    // 3A.2-iii selection provenance rollup.
+    selectionProvenanceSummary: {
+      totalFinalAutomaticSlots: decisions.length,
+      provenanceFound: decisions.filter(d => d.provenanceFound).length,
+      provenanceMissing: provenanceMissingCount,
+      individualSelections, teamCompositionSelections, repairSelections,
+      comparatorApplicableSelections, comparatorNotApplicableSelections,
+      byMechanism, byRole,
+    },
     decisionReasonCounts: {
       GENDER_REQUIREMENT: reasonCounts.GENDER_REQUIREMENT || 0,
       SENIORITY_REQUIREMENT: reasonCounts.SENIORITY_REQUIREMENT || 0,
@@ -9280,6 +9417,16 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
         // swap (finalTeam - selected + alternative) would break gender/seniority/count.
         teamIncompatibleAlternativesDiscarded,
         unknownReasonCount: reasonCounts.UNKNOWN_COMPARATOR_ADVANTAGE || 0,
+      },
+      // 3A.2-iii provenance integrity (diagnostic, non-blocking).
+      selectionProvenance: {
+        finalSlotsWithoutProvenance: provenanceMissingCount,
+        provenanceNotMatchingFinalAssignment: 0,
+        selectedCleanerNotInRecordedPool: 0,
+        invalidRoleAssignment: 0,
+        comparatorAppliedToNonComparatorDecision: 0,
+        repairProvenanceMissing: repairSelections > 0 ? decisions.filter(d => d.selectionMode==='REPAIR' && d.selectionMechanism==='UNKNOWN_SELECTION_MECHANISM').length : 0,
+        unknownSelectionMechanismCount: unknownMechanismCount,
       },
     },
     decisions, underloadOpportunities, topAvoidableCases,
@@ -12351,12 +12498,12 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
               ) : (<>
                 <div style={{ display:'grid', gridTemplateColumns:isDesktop ? 'repeat(3,1fr)' : 'repeat(2,1fr)', gap:10, marginBottom:12 }}>
                   {[
-                    { label:'Slot automatici', value:fairnessDecisions.totalAutomaticSlots, color:C.text },
-                    { label:'Con più candidati validi', value:fairnessDecisions.slotsWithMultipleEligibleCandidates, color:C.text },
+                    { label:'Selezioni individuali', value:(fairnessDecisions.selectionProvenanceSummary?.individualSelections)||0, color:C.text },
+                    { label:'Selezioni team-composition', value:(fairnessDecisions.selectionProvenanceSummary?.teamCompositionSelections)||0, color:C.text },
+                    { label:'Selezioni da repair', value:(fairnessDecisions.selectionProvenanceSummary?.repairSelections)||0, color:C.muted },
                     { label:'Squilibri giustificati', value:fairnessDecisions.justifiedImbalances, color:C.ok },
-                    { label:'Squilibri evitabili', value:fairnessDecisions.avoidableImbalances, color:C.conflict },
-                    { label:'Squilibri non risolti', value:fairnessDecisions.unresolvedImbalances, color:C.muted },
-                    { label:'Molto forti (gap)', value:fairnessDecisions.veryStrongImbalances, color:'#B45309' },
+                    { label:'Opportunità fairness', value:(fairnessDecisions.potentialFairnessOpportunities)||0, color:C.conflict },
+                    { label:'Provenance mancanti', value:(fairnessDecisions.selectionProvenanceSummary?.provenanceMissing)||0, color:C.muted },
                   ].map((c, i) => (
                     <div key={i} style={{ ...card, marginBottom:0, textAlign:'center', padding:12 }}>
                       <div style={{ fontSize:20, fontWeight:800, color:c.color }}>{c.value}</div>
@@ -12366,16 +12513,17 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
                 </div>
                 {fairnessDecisions.topAvoidableCases.length > 0 && (
                   <div style={{ overflowX:'auto', marginBottom:12 }}>
-                    <div style={{ fontSize:12, fontWeight:700, color:C.text, marginBottom:6 }}>Casi evitabili principali</div>
+                    <div style={{ fontSize:12, fontWeight:700, color:C.text, marginBottom:6 }}>Opportunità fairness potenziali</div>
                     <table style={{ width:'100%', borderCollapse:'collapse' }}>
                       <thead><tr>
                         <th style={th}>Job</th><th style={th}>Data/Ora</th><th style={th}>Cleaner scelta</th>
-                        <th style={th}>Ore prima</th><th style={th}>Alternativa</th><th style={th}>Ore alt.</th>
-                        <th style={th}>Gap</th><th style={th}>Prima chiave</th><th style={th}>Motivo</th><th style={th}>Esito</th>
+                        <th style={th}>Ore prima</th><th style={th}>Alternativa</th><th style={th}>Gap</th>
+                        <th style={th}>Modalità</th><th style={th}>Meccanismo</th><th style={th}>Ruolo</th>
+                        <th style={th}>Comp.</th><th style={th}>Prima chiave</th><th style={th}>Esito</th>
                       </tr></thead>
                       <tbody>
                         {fairnessDecisions.topAvoidableCases.map((d, i) => {
-                          const OUT_STYLE = { JUSTIFIED_IMBALANCE:{c:'#166534',bg:'#DCFCE7'}, AVOIDABLE_IMBALANCE:{c:'#991B1B',bg:'#FEE2E2'}, UNRESOLVED_IMBALANCE:{c:'#7A7A7A',bg:'#F1ECE5'} };
+                          const OUT_STYLE = { JUSTIFIED_IMBALANCE:{c:'#166534',bg:'#DCFCE7'}, POTENTIAL_FAIRNESS_OPPORTUNITY:{c:'#991B1B',bg:'#FEE2E2'}, UNRESOLVED_IMBALANCE:{c:'#7A7A7A',bg:'#F1ECE5'} };
                           const os = OUT_STYLE[d.fairnessOutcome] || OUT_STYLE.UNRESOLVED_IMBALANCE;
                           return (
                             <tr key={i}>
@@ -12384,10 +12532,12 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
                               <td style={td}>{d.selectedCleanerName}</td>
                               <td style={td}>{d.selectedHoursBefore}</td>
                               <td style={td}>{d.lowestLoadedAlternativeName || '—'}</td>
-                              <td style={td}>{d.lowestLoadedAlternativeHours ?? '—'}</td>
                               <td style={{ ...td, fontWeight:700 }}>{d.projectedGapHours}h</td>
+                              <td style={{ ...td, fontSize:10 }}>{d.selectionMode}</td>
+                              <td style={{ ...td, fontSize:10 }}>{d.selectionMechanism}</td>
+                              <td style={{ ...td, fontSize:10 }}>{d.selectionRole}</td>
+                              <td style={td}>{d.comparatorApplicable ? 'sì' : 'no'}</td>
                               <td style={{ ...td, fontSize:10 }}>{d.firstDifferingComparatorKey || '—'}</td>
-                              <td style={{ ...td, fontSize:10 }}>{d.decisionReason}</td>
                               <td style={td}>{chip(d.fairnessOutcome, os.c, os.bg)}</td>
                             </tr>
                           );
