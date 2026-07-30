@@ -9045,7 +9045,7 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
       duplicateDiscarded = 0, decisionsMissingJobMetadata = 0, decisionsNotMatchingFinal = 0;
   // 3A.2-ii comparator integrity counters.
   let decisionsWithComparator = 0, decisionsMissingComparator = 0,
-      comparatorSelectedNotWinner = 0;
+      comparatorSelectedNotWinner = 0, teamIncompatibleAlternativesDiscarded = 0;
   const reasonCounts = {};
 
   const acceptedByKey = new Map();  // stable decision id → accepted event
@@ -9090,11 +9090,42 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
   acceptedByKey.forEach(sel => {
     const jobId = sel.jobId || '';
     const fj = finalById.get(jobId);
-    // 8. Alternatives = winning-plan eligible candidates, not template-only, not the selected.
-    const alternatives = (availByJob.get(jobId) || [])
-      .filter(a => !templateOnlyIds.has(a.cleanerId) && a.cleanerId !== sel.cleanerId)
-      .map(a => ({ cleanerId:a.cleanerId, cleanerName:a.data?.cleanerName || a.cleanerId,
-        totalHoursBefore:Number(a.data?.weeklyHoursBefore) || 0 }));
+    const finalTeamIds = (fj && (fj.assignedCleanerIds || fj.cleanerIds)) || [];
+    const reqCleaners = fj ? getJobRequiredCleaners(fj) : 0;
+    const genReq = fj ? getJobGenderRequirement(fj) : { male:0, female:0 };
+    const senReq = fj ? getJobSeniorRequirement(fj) : { senior:0 };
+    // A candidate is a REAL interchangeable alternative only if swapping it in for the
+    // selected cleaner keeps the whole final team valid: required count, gender split,
+    // seniority, and no duplicates. Uses the canonical requirement/count helpers — the
+    // requirement logic is never re-implemented here.
+    const isTeamCompatibleAlternative = altId => {
+      if(!fj) return true; // no final team to protect → cannot judge, keep prior behaviour
+      if(finalTeamIds.includes(altId)) return false; // already on the team → not a swap
+      const swapped = dedupeCleanerIds([
+        ...finalTeamIds.filter(id => id !== sel.cleanerId),
+        altId,
+      ]);
+      if(swapped.length < reqCleaners) return false;
+      const g = countTeamGender(swapped);
+      if((genReq.male||0) > 0 && (g.male||0) < (genReq.male||0)) return false;
+      if((genReq.female||0) > 0 && (g.female||0) < (genReq.female||0)) return false;
+      const s = countTeamSenior(swapped);
+      if((senReq.senior||0) > 0 && (s.senior||0) < (senReq.senior||0)) return false;
+      return true;
+    };
+    // 8. Alternatives = winning-plan eligible, not template-only, not the selected, AND
+    // team-compatible after the swap. Count how many were discarded for team composition.
+    const rawAlternatives = (availByJob.get(jobId) || [])
+      .filter(a => !templateOnlyIds.has(a.cleanerId) && a.cleanerId !== sel.cleanerId);
+    const alternatives = [];
+    rawAlternatives.forEach(a => {
+      if(isTeamCompatibleAlternative(a.cleanerId)){
+        alternatives.push({ cleanerId:a.cleanerId, cleanerName:a.data?.cleanerName || a.cleanerId,
+          totalHoursBefore:Number(a.data?.weeklyHoursBefore) || 0 });
+      } else {
+        teamIncompatibleAlternativesDiscarded++;
+      }
+    });
     const selHours = Number(sel.data?.weeklyHoursBefore) || 0;
     let lowest = null;
     alternatives.forEach(a => { if(!lowest || a.totalHoursBefore < lowest.totalHoursBefore) lowest = a; });
@@ -9103,10 +9134,18 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     const hasMeta = !!(fj && (fj.displayName || fj.day || fj.startTime));
     if(!hasMeta) decisionsMissingJobMetadata++;
 
-    // 3A.2-ii: comparator evidence for the selected-vs-lowest-alternative decision.
-    const cmpEv = comparatorByKey.get(jobId + '|' + sel.cleanerId);
-    const firstKey = cmpEv ? (cmpEv.data?.firstDifferingKey || null) : null;
-    let decisionReason = cmpEv ? (cmpEv.data?.decisionReason || 'UNKNOWN_COMPARATOR_ADVANTAGE') : 'UNKNOWN_COMPARATOR_ADVANTAGE';
+    // No team-compatible alternative existed, but individually-eligible candidates were
+    // discarded for team composition → the selection is forced by team requirements.
+    const forcedByTeamComposition = !lowest && rawAlternatives.length > 0;
+
+    // 3A.2-ii: comparator evidence for the selected-vs-lowest-alternative decision. When
+    // the selection is forced by team composition, there is no fairness comparison to run.
+    const cmpEv = (!forcedByTeamComposition && lowest) ? comparatorByKey.get(jobId + '|' + sel.cleanerId) : null;
+    const firstKey = forcedByTeamComposition ? 'teamCompositionRequirement'
+                   : (cmpEv ? (cmpEv.data?.firstDifferingKey || null) : null);
+    let decisionReason = forcedByTeamComposition ? 'TEAM_COMPOSITION_REQUIREMENT'
+                       : (cmpEv ? (cmpEv.data?.decisionReason || 'UNKNOWN_COMPARATOR_ADVANTAGE') : 'UNKNOWN_COMPARATOR_ADVANTAGE');
+    // Only count a selected-not-winner when there IS a real interchangeable alternative.
     if(cmpEv && cmpEv.data?.selectedIsWinner === false) comparatorSelectedNotWinner++;
 
     // Reclassify fairness outcome. JUSTIFIED when the selected won on a real operational
@@ -9118,7 +9157,9 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
       'TRAVEL_ADVANTAGE','REST_PREFERENCE','FUTURE_CAPACITY_PRESERVATION','PROPERTY_CONTINUITY',
     ]);
     let fairnessOutcome;
-    if(!lowest || gap < FDD_AVOIDABLE_GAP){
+    if(forcedByTeamComposition){
+      fairnessOutcome = 'JUSTIFIED_IMBALANCE'; // no interchangeable alternative → justified
+    } else if(!lowest || gap < FDD_AVOIDABLE_GAP){
       fairnessOutcome = 'JUSTIFIED_IMBALANCE'; // gap not material → nothing to avoid
     } else if(!cmpEv || decisionReason === 'UNKNOWN_COMPARATOR_ADVANTAGE'){
       fairnessOutcome = 'UNRESOLVED_IMBALANCE';
@@ -9235,6 +9276,9 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
         // selected NOT ranking first. With decision-time snapshots this must be 0; a
         // non-zero value means an evidence source other than the frozen snapshot leaked in.
         decisionTimeSnapshotMismatchCount: comparatorSelectedNotWinner,
+        // 3A.2-ii final microfix: individually-eligible candidates discarded because the
+        // swap (finalTeam - selected + alternative) would break gender/seniority/count.
+        teamIncompatibleAlternativesDiscarded,
         unknownReasonCount: reasonCounts.UNKNOWN_COMPARATOR_ADVANTAGE || 0,
       },
     },
