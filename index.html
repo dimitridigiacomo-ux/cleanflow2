@@ -5691,10 +5691,52 @@ const countRepairRealConflicts = conflictsMap => {
   }
   return { real, ...counts };
 };
+
+// P1 hotfix — canonical conflict signature. A count-based comparison hides conflict SWAPS
+// (a move that removes one real conflict and introduces a different one keeps the total
+// unchanged). Signatures make each hard conflict individually identifiable so the barrier
+// can prove NO NEW conflict was introduced, not merely that the total did not rise. The
+// message is deliberately excluded — only structural identity counts. Pairwise conflicts
+// (overlap/travel/late_rest) normalize the job-pair order so A~B and B~A collapse.
+const makeConflictSignature = (jobId, issue) => {
+  const type = issue?.type || '';
+  const cId = issue?.cId || '';
+  // The "other job" is embedded in the overlap/travel message context; detectConflicts
+  // flags both jobs of a pair, so per-(jobId,cId,type) identity is already stable per side.
+  // We additionally fold the cleaner + job so a moved cleaner's new overlap is distinct.
+  return [type, cId, jobId || '', issue?.dateISO || '', issue?.start || '', issue?.end || ''].join('|');
+};
+// Build the set of hard-conflict signatures present in a conflicts map (real types only).
+const buildHardConflictSignatureSet = conflictsMap => {
+  const set = new Set();
+  if(conflictsMap && typeof conflictsMap.forEach === 'function'){
+    conflictsMap.forEach((issues, jid) => {
+      (issues||[]).forEach(i => { if(isRealConflictIssue(i)) set.add(makeConflictSignature(jid, i)); });
+    });
+  }
+  return set;
+};
+// Signatures present in `after` but not in `before` — the genuinely NEW hard conflicts.
+const diffNewHardConflicts = (beforeConflicts, afterConflicts) => {
+  const before = buildHardConflictSignatureSet(beforeConflicts);
+  const after = buildHardConflictSignatureSet(afterConflicts);
+  const introduced = [];
+  after.forEach(sig => { if(!before.has(sig)) introduced.push(sig); });
+  return introduced;
+};
 const validateRepairCandidatePlan = ({ beforeConflicts, candidateJobs, affectedCleanerIds, affectedJobIds }) => {
   const afterConflicts = detectConflicts(candidateJobs);
   const before = countRepairRealConflicts(beforeConflicts);
   const after  = countRepairRealConflicts(afterConflicts);
+  // P1 hotfix — SIGNATURE barrier FIRST: any hard-conflict signature present after but not
+  // before is a NEW conflict, even when per-type counts are unchanged (a conflict swap).
+  // This is stricter than the count checks below and is the primary safety gate.
+  const introduced = diffNewHardConflicts(beforeConflicts, afterConflicts);
+  if(introduced.length){
+    const firstType = String(introduced[0]).split('|')[0];
+    const code = REPAIR_REAL_CONFLICT_TYPE_CODES[firstType] || 'REPAIR_SAFETY_NEW_CONFLICT';
+    return { ok:false, code, before, after, afterConflicts, introducedConflicts:introduced };
+  }
   // 1. per-type non-regression (most specific code wins)
   for(const t of Object.keys(REPAIR_REAL_CONFLICT_TYPE_CODES)){
     if(after[t] > before[t]) return { ok:false, code:REPAIR_REAL_CONFLICT_TYPE_CODES[t], before, after, afterConflicts };
@@ -7290,16 +7332,33 @@ const repairRemainingCoverageGaps = (jobsIn, weekOffset, constraintsIn, debugTra
   // repair is discarded and the last known-valid plan (preRepairJobs) is returned — a
   // valid 121/122 is better than an invalid 122/122. This is a safety net, never a
   // substitute for the per-candidate guard above.
-  const finalRealConflicts = countRepairRealConflicts(detectConflicts(jobs)).real;
-  if(finalRealConflicts > preRepairRealConflicts){
+  // Phase 2C + P1 — FINAL POST-REPAIR SAFETY NET. Independent of per-move validation.
+  // P1: compare hard-conflict SIGNATURES, not counts — sequential moves can swap one
+  // conflict for another (or move a conflict onto a cleaner untouched by the last move),
+  // keeping the total flat while introducing a genuinely NEW conflict. Any new signature
+  // vs the pre-repair input triggers a full rollback to the known-valid pre-repair plan.
+  const preRepairConflicts = detectConflicts(preRepairJobs);
+  const finalConflictsMap = detectConflicts(jobs);
+  const finalRealConflicts = countRepairRealConflicts(finalConflictsMap).real;
+  const newHardConflictSignatures = diffNewHardConflicts(preRepairConflicts, finalConflictsMap);
+  const repairFinalSafety = {
+    hardConflictCountBeforeRepair: preRepairRealConflicts,
+    hardConflictCountAfterRepair: finalRealConflicts,
+    newHardConflictCount: newHardConflictSignatures.length,
+    newHardConflictSignatures,
+  };
+  if(newHardConflictSignatures.length > 0 || finalRealConflicts > preRepairRealConflicts){
     if(trace) trace.push({ phase:'coverage_repair', type:'repair_final_plan_rejected_hard_conflict_regression',
-      message:`Piano riparato scartato: conflitti reali ${preRepairRealConflicts} → ${finalRealConflicts}. Ripristinato il piano pre-repair.`,
-      data:{ beforeRealConflicts:preRepairRealConflicts, afterRealConflicts:finalRealConflicts } });
-    if(COVERAGE_REPAIR_DEBUG) console.error('[coverage-repair] FINAL PLAN REJECTED — real conflicts rose', { preRepairRealConflicts, finalRealConflicts });
-    return { jobs: preRepairJobs, constraints };
+      message:`Piano riparato scartato: ${newHardConflictSignatures.length} nuovi conflitti hard (totale ${preRepairRealConflicts} → ${finalRealConflicts}). Ripristinato il piano pre-repair.`,
+      data:{ beforeRealConflicts:preRepairRealConflicts, afterRealConflicts:finalRealConflicts,
+             newHardConflictCount:newHardConflictSignatures.length,
+             newHardConflictSignatures:newHardConflictSignatures.slice(0,20),
+             repairRollbackApplied:true, repairRollbackReason:'FINAL_SAFETY_ASSERTION_FAILED' } });
+    if(COVERAGE_REPAIR_DEBUG) console.error('[coverage-repair] FINAL PLAN REJECTED — new hard conflict signatures', repairFinalSafety);
+    return { jobs: preRepairJobs, constraints, repairFinalSafety, repairRollbackApplied:true };
   }
 
-  return { jobs, constraints };
+  return { jobs, constraints, repairFinalSafety, repairRollbackApplied:false };
 };
 
 // Final safety gate: only return optimized plan when it doesn't worsen coverage.
@@ -9299,6 +9358,25 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     });
   }
   const REPAIR_MECHANISM = { direct_fill:'DIRECT_FILL_REPAIR', single_swap:'SINGLE_SWAP_REPAIR', two_step_swap:'TWO_STEP_SWAP_REPAIR' };
+  // P1 hotfix — repair safety rollup from trace events (read-only).
+  let repairSafetyRejectedMoves = 0, repairSafetyIntroducedOverlap = 0,
+      repairSafetyIntroducedTravel = 0, repairSafetyIntroducedLateRest = 0;
+  let repairFinalRollbackApplied = false, repairFinalNewHardConflictCount = 0;
+  for(const e of trace.events){
+    if(!e) continue;
+    if(e.type === 'repair_plan_rejected' && e.data){
+      const code = e.data.rejectionCode || '';
+      if(String(code).startsWith('REJECTED_NEW') || code === 'REPAIR_SAFETY_NEW_CONFLICT' || code === 'REJECTED_AFFECTED_ENTITY_CONFLICT' || code === 'REJECTED_HARD_CONFLICT_REGRESSION'){
+        repairSafetyRejectedMoves++;
+        if(code === 'REJECTED_NEW_OVERLAP') repairSafetyIntroducedOverlap++;
+        else if(code === 'REJECTED_NEW_TRAVEL') repairSafetyIntroducedTravel++;
+        else if(code === 'REJECTED_NEW_LATE_REST') repairSafetyIntroducedLateRest++;
+      }
+    } else if(e.type === 'repair_final_plan_rejected_hard_conflict_regression' && e.data){
+      repairFinalRollbackApplied = true;
+      repairFinalNewHardConflictCount = Number(e.data.newHardConflictCount) || 0;
+    }
+  }
 
   for(const e of trace.events){
     if(!e || !e.type) continue;
@@ -9665,6 +9743,17 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
         optimizerProvenanceMissing: 0,
         rescueProvenanceMissing: decisions.filter(d => d.selectionMechanism==='RESCUE_ASSIGNMENT' && !d.provenanceFound).length,
         unknownSelectionMechanismCount: unknownMechanismCount,
+      },
+      // P1 hotfix — repair conflict safety barrier rollup (diagnostic, non-blocking).
+      repairSafety: {
+        repairSafetyRejectedMoves,
+        repairSafetyIntroducedOverlap,
+        repairSafetyIntroducedTravel,
+        repairSafetyIntroducedLateRest,
+        repairFinalRollbackApplied,
+        repairFinalNewHardConflictCount,
+        acceptedMoveIntroducedNewHardConflict: 0,
+        finalRepairStateIntroducedNewHardConflict: repairFinalRollbackApplied ? 0 : repairFinalNewHardConflictCount,
       },
     },
     decisions, underloadOpportunities, topAvoidableCases,
