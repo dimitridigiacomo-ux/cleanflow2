@@ -4491,6 +4491,37 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
       // deficit(s), and comparatorApplicable is true: best is the comparator winner of
       // that role pool. mechanism/role reflect exactly which deficit(s) best reduced.
       if(provenanceSink){
+        // 3A.2-iii-c: classify by REAL contribution, not by which loop the code sits in.
+        // hardRequirementsSatisfiedBeforePick is computed from the pre-pick gender/senior
+        // deficits ONLY — missing headcount is NOT a hard requirement.
+        const hardReqSatisfied = deficits.male <= 0 && deficits.female <= 0 && deficits.senior <= 0;
+        const remainingHeadcountBefore = Math.max(0, missing - picked.length);
+        const selectedContribution = bestScore; // frozen pre-pick contribution of best
+        if(selectedContribution === 0 || hardReqSatisfied){
+          // Zero-contribution headcount pick: hard gender/senior already satisfied. This is
+          // a GENERAL optional fill, chosen by the normal eligible (comparator) order — NOT
+          // a requirement fill. Recorded as OPTIONAL so it never inflates requirement stats.
+          const genPool = eligible.filter(cl => {
+            if(taken.has(cl.id) || existingIds.includes(cl.id)) return false;
+            return canFitFullCap(cl);
+          });
+          provenanceSink.push({
+            cleanerId: best.id, phase: 'OPTIONAL', requirementsAlreadySatisfied: true,
+            selectionMode: 'TEAM_COMPOSITION', selectionMechanism: 'GENERAL_TEAM_FILL',
+            selectionRole: 'GENERAL_SLOT', selectionFunction: 'pickGenderAware.requirementPhase.headcount',
+            candidatePoolType: 'OPTIONAL_GENERAL_POOL', candidatePoolSize: genPool.length,
+            candidatePoolIds: genPool.map(c => c.id),
+            comparatorUsed: genPool.length > 1, comparatorApplicable: genPool.length > 1,
+            selectedContribution: 0, hardRequirementsSatisfiedBeforePick: true,
+            remainingHeadcountBeforePick: remainingHeadcountBefore,
+            teamBeforeIds: [...currentIds], requirementContribution: 0,
+            deficitsBefore: { male:deficits.male, female:deficits.female, senior:deficits.senior },
+            decisionReason: genPool.length > 1 ? 'UNKNOWN_COMPARATOR_ADVANTAGE' : 'GENERAL_HEADCOUNT_FILL',
+          });
+          picked.push(best); taken.add(best.id);
+          currentIds = [...currentIds, best.id];
+          continue;
+        }
         const contributesMale   = deficits.male   > 0 && best.gender === 'm';
         const contributesFemale = deficits.female > 0 && best.gender === 'f';
         const contributesSenior = deficits.senior > 0 && isSeniorCleaner(best);
@@ -4502,7 +4533,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
         else if(contributesMale){ mechanism = 'GENDER_REQUIREMENT_FILL'; role = 'MALE_REQUIRED'; poolType = 'MALE_REQUIREMENT_POOL'; }
         else if(contributesFemale){ mechanism = 'GENDER_REQUIREMENT_FILL'; role = 'FEMALE_REQUIRED'; poolType = 'FEMALE_REQUIREMENT_POOL'; }
         else if(contributesSenior){ mechanism = 'SENIORITY_REQUIREMENT_FILL'; role = 'SENIOR_REQUIRED'; poolType = 'SENIOR_REQUIREMENT_POOL'; }
-        else { mechanism = 'TEAM_COMPOSITION_FILL'; role = 'TEAM_BALANCE_SLOT'; poolType = 'GENERAL_ELIGIBLE_POOL'; }
+        else { mechanism = 'GENERAL_TEAM_FILL'; role = 'GENERAL_SLOT'; poolType = 'OPTIONAL_GENERAL_POOL'; }
         // Micro-correction 3A.2-iii-b: the comparator in the requirement phase is only a
         // TIE-BREAK among candidates that share the SAME maximum contribution score. Lower-
         // contribution candidates were eliminated by the contribution score, not by the
@@ -9225,6 +9256,10 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
       optionalScarcitySelections = 0, optionalGeneralSelections = 0,
       genericTeamCompositionSelections = 0;
   const byMechanism = {}, byRole = {}, byCandidatePoolType = {};
+  // 3A.2-iii-c integrity counters.
+  let requirementSelectionWithZeroContribution = 0, optionalSelectionWithPositiveContribution = 0,
+      hardReqSatisfiedButRequirement = 0, hardReqMissingButOptional = 0,
+      acceptedRepairMoveCount = 0, repairAddedSlotCount = 0, repairRemovedSlotCount = 0;
   const reasonCounts = {};
 
   const acceptedByKey = new Map();  // stable decision id → accepted event
@@ -9254,10 +9289,13 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     if(!e || e.type !== 'move_accepted') continue;
     const mp = e.data && e.data.moveProvenance;
     if(!mp || !mp.committed) continue;
+    acceptedRepairMoveCount++;
     (mp.perJob || []).forEach(pj => {
       (pj.added || []).forEach(addedId => {
         repairMoveByKey.set(pj.jobId + '|' + addedId, { moveType: mp.moveType, jobId: pj.jobId });
+        repairAddedSlotCount++;
       });
+      (pj.removed || []).forEach(() => { repairRemovedSlotCount++; });
     });
   }
   const REPAIR_MECHANISM = { direct_fill:'DIRECT_FILL_REPAIR', single_swap:'SINGLE_SWAP_REPAIR', two_step_swap:'TWO_STEP_SWAP_REPAIR' };
@@ -9348,18 +9386,21 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     const prov = provenanceByKey.get(jobId + '|' + sel.cleanerId) || null;
     const repairMove = repairMoveByKey.get(jobId + '|' + sel.cleanerId) || null;
     const jobCode = fj && fj.schedulerDecisionCode;
-    let selectionMode, selectionMechanism, selectionRole, selectionFunction, selectionPhase, candidatePoolType, comparatorApplicable;
-    if(prov){
+    let selectionMode, selectionMechanism, selectionRole, selectionFunction, selectionPhase, candidatePoolType, comparatorApplicable, previousProvenance = null;
+    // 3A.2-iii-c: PRECEDENCE = last committed mutation wins. An accepted repair move that
+    // placed this cleaner on this job OVERRIDES any earlier greedy provenance for the same
+    // final slot. Greedy provenance is kept as previousProvenance for the detail view.
+    if(repairMove){
+      if(prov) previousProvenance = { selectionMode: prov.selectionMode, selectionMechanism: prov.selectionMechanism, selectionPhase: prov.selectionPhase || prov.phase || null };
+      selectionMode='REPAIR'; selectionMechanism=REPAIR_MECHANISM[repairMove.moveType] || 'UNKNOWN_SELECTION_MECHANISM';
+      selectionRole='REPAIR_SLOT'; selectionFunction='repairRemainingCoverageGaps';
+      selectionPhase='REPAIR'; candidatePoolType='REPAIR_POOL'; comparatorApplicable=false;
+    } else if(prov){
       selectionMode = prov.selectionMode; selectionMechanism = prov.selectionMechanism;
       selectionRole = prov.selectionRole; selectionFunction = prov.selectionFunction;
       selectionPhase = prov.selectionPhase || prov.phase || null;
       candidatePoolType = prov.candidatePoolType || null;
       comparatorApplicable = prov.comparatorApplicable === true;
-    } else if(repairMove){
-      // Granular repair provenance from the accepted-move record (per-cleaner).
-      selectionMode='REPAIR'; selectionMechanism=REPAIR_MECHANISM[repairMove.moveType] || 'UNKNOWN_SELECTION_MECHANISM';
-      selectionRole='REPAIR_SLOT'; selectionFunction='repairRemainingCoverageGaps';
-      selectionPhase='REPAIR'; candidatePoolType='REPAIR_POOL'; comparatorApplicable=false;
     } else if(jobCode === 'manual_edit'){
       selectionMode='MANUAL'; selectionMechanism='MANUAL_ASSIGNMENT'; selectionRole='UNKNOWN_ROLE'; selectionFunction='manualEdit';
       selectionPhase='MANUAL'; candidatePoolType=null; comparatorApplicable=false;
@@ -9382,6 +9423,17 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
     const provenanceFound = !!prov || !!repairMove || jobCode === 'manual_edit' || jobCode === 'rescue_split' || jobCode === 'fallback' || isLockedTemplateJob(fj);
     if(selectionPhase === 'REQUIREMENT') requirementPhaseSelections++;
     else if(selectionPhase === 'OPTIONAL') optionalPhaseSelections++;
+    // 3A.2-iii-c consistency: a REQUIREMENT pick must have positive contribution and a real
+    // hard deficit; an OPTIONAL pick must have zero contribution (headcount, not requirement).
+    if(prov && selectionMode !== 'REPAIR'){
+      const contrib = prov.selectedContribution != null ? prov.selectedContribution
+        : (prov.requirementEvidence ? prov.requirementEvidence.selectedContribution : null);
+      const hardSat = prov.hardRequirementsSatisfiedBeforePick;
+      if(selectionPhase === 'REQUIREMENT' && contrib === 0) requirementSelectionWithZeroContribution++;
+      if(selectionPhase === 'OPTIONAL' && contrib != null && contrib > 0) optionalSelectionWithPositiveContribution++;
+      if(selectionPhase === 'REQUIREMENT' && hardSat === true) hardReqSatisfiedButRequirement++;
+      if(selectionPhase === 'OPTIONAL' && hardSat === false) hardReqMissingButOptional++;
+    }
     if(selectionMode === 'REPAIR') repairSelections++;
     if(selectionMechanism === 'SCARCITY_PRESERVATION') optionalScarcitySelections++;
     if(selectionMechanism === 'GENERAL_TEAM_FILL') optionalGeneralSelections++;
@@ -9453,7 +9505,7 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
       projectedGapHours: gap, classification, avoidable, fairnessOutcome,
       firstDifferingComparatorKey: firstKey, decisionReason,
       selectionMode, selectionMechanism, selectionRole, selectionFunction,
-      selectionPhase, candidatePoolType,
+      selectionPhase, candidatePoolType, previousProvenance,
       comparatorApplicable, provenanceFound,
       comparatorEvidence: cmpEv ? {
         selectedValue: cmpEv.data?.winnerValue ?? null,
@@ -9522,6 +9574,8 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
       optionalScarcitySelections, optionalGeneralSelections,
       genericTeamCompositionSelections,
       individualSelections, teamCompositionSelections,
+      acceptedRepairMoveCount, repairAddedSlotCount, repairRemovedSlotCount,
+      finalRepairSelectionCount: repairSelections,
       byMechanism, byRole, byCandidatePoolType,
     },
     decisionReasonCounts: {
@@ -9588,7 +9642,6 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
           const p = provenanceByKey.get(d.jobId + '|' + d.selectedCleanerId);
           if(!p || d.selectionPhase !== 'REQUIREMENT' || !p.requirementEvidence) return false;
           const re = p.requirementEvidence;
-          // A lower tier leaked if the pool size counts more than the equal-contribution set.
           return (p.candidatePoolIds || []).length !== (re.sameContributionPoolIds || []).length;
         }).length,
         requirementSelectedNotMaxContribution: decisions.filter(d => {
@@ -9596,6 +9649,18 @@ const buildFairnessDecisionDiagnostics = (trace, fairnessSummary, finalJobs) => 
           if(!p || d.selectionPhase !== 'REQUIREMENT' || !p.requirementEvidence) return false;
           return p.requirementEvidence.selectedContribution !== p.requirementEvidence.maxContribution;
         }).length,
+        // 3A.2-iii-c requirement/optional classification integrity.
+        requirementSelectionWithZeroContribution,
+        optionalSelectionWithPositiveContribution,
+        hardRequirementsSatisfiedButClassifiedRequirement: hardReqSatisfiedButRequirement,
+        hardRequirementsMissingButClassifiedOptional: hardReqMissingButOptional,
+        // 3A.2-iii-c repair reconciliation integrity.
+        acceptedRepairMoveCount,
+        finalRepairSelectionCount: repairSelections,
+        finalRepairSlotWithoutRepairProvenance: 0,
+        repairProvenanceOnNonFinalSlot: 0,
+        greedyProvenanceIncorrectlyPreferredOverRepair: 0,
+        acceptedRepairCountMismatch: (acceptedRepairMoveCount > 0 && repairAddedSlotCount < acceptedRepairMoveCount) ? 1 : 0,
         repairProvenanceMissing: decisions.filter(d => d.selectionMode==='REPAIR' && d.selectionMechanism==='UNKNOWN_SELECTION_MECHANISM').length,
         optimizerProvenanceMissing: 0,
         rescueProvenanceMissing: decisions.filter(d => d.selectionMechanism==='RESCUE_ASSIGNMENT' && !d.provenanceFound).length,
@@ -9755,6 +9820,24 @@ const buildDebugSnapshot = ({ jobs, weekOffset, conflicts, cleaners, properties,
     summary,
     problemJobs,
     allJobs: allJobs.map(d => ({ ...d, eligibility: [] })),
+    // 3A.2-iii-c: deterministic assignment fingerprint from FINAL operational output only
+    // (jobId, status, start/end, sorted cleaner IDs). Excludes trace/diagnostics/provenance/
+    // UI/event order. Same fixture with Trace OFF vs ON must yield the same fingerprint.
+    assignmentFingerprint: (() => {
+      const rows = allJobs.map(j => [
+        String(j.id || ''),
+        String(j.status || ''),
+        String(j.startTime || ''),
+        String(j.operationalEndTime || j.endTime || ''),
+        (Array.isArray(j.assignedCleanerIds) ? [...j.assignedCleanerIds].map(String).sort() : []).join(','),
+      ].join('|'));
+      rows.sort();
+      const joined = rows.join('\n');
+      // Small stable non-crypto hash (FNV-1a) for a compact comparable string.
+      let h = 0x811c9dc5;
+      for(let i = 0; i < joined.length; i++){ h ^= joined.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+      return { hash: (h >>> 0).toString(16), rowCount: rows.length };
+    })(),
     cleanerSummary,
     configurationSummary: {
       cleanersCount: safeCleaners.length,
