@@ -1038,13 +1038,21 @@ const buildLocalAssignmentOptions = (targetJob, jobs, weekOffset) => {
 
   if(needed===1){
     // Fix 4: team-composition validation and the resulting action must always
-    // reason on the CURRENT team already assigned to the duty, never on the
+    // reason on the team the duty will actually END UP with, never on the
     // candidate alone. applySolverAction() replaces j.cleanerIds wholesale (no
     // merge — verified), so action.cleanerIds must already be the complete
     // final team, not just the newly added cleaner.
+    // Idempotency fix: same two modes as the multi-cleaner branch below.
+    // replacementMode: the duty already carries its full team (>= needed), so
+    // the candidate REPLACES it - the base is empty and the final team stays
+    // at `needed`. Otherwise the candidate fills the missing slot on top of
+    // the existing team. Without this, every "Trova soluzione" click appended
+    // one more cleaner to a 1-cleaner duty and the team grew without bound.
+    const replacementMode = existingIds.length >= needed;
+    const baseIds   = replacementMode ? [] : existingIds;
     const candidateTeamValid = c => {
       if(!hasGenderReq) return true;
-      return genderRequirementMet(safeTargetJob, dedupeCleanerIds([...existingIds, c.cleanerId]));
+      return genderRequirementMet(safeTargetJob, dedupeCleanerIds([...baseIds, c.cleanerId]));
     };
     // Exclude candidates already assigned to this job — recommending/applying the
     // same cleaner again would be a no-op (UI says "applied" but nothing changes).
@@ -1063,9 +1071,9 @@ const buildLocalAssignmentOptions = (targetJob, jobs, weekOffset) => {
       return false;
     });
     if(pool[0]){
-      recommended = {...pool[0], action:{type:'assign',jobId:safeTargetJob.id,cleanerIds:dedupeCleanerIds([...existingIds, pool[0].cleanerId])}};
+      recommended = {...pool[0], action:{type:'assign',jobId:safeTargetJob.id,cleanerIds:dedupeCleanerIds([...baseIds, pool[0].cleanerId])}};
     }
-    alternatives = pool.slice(1,3).map(c=>({...c,action:{type:'assign',jobId:safeTargetJob.id,cleanerIds:dedupeCleanerIds([...existingIds, c.cleanerId])}}));
+    alternatives = pool.slice(1,3).map(c=>({...c,action:{type:'assign',jobId:safeTargetJob.id,cleanerIds:dedupeCleanerIds([...baseIds, c.cleanerId])}}));
   } else {
     // Multi-cleaner. Two modes:
     // replacementMode: job already has a full team — build a fresh replacement team of `needed`.
