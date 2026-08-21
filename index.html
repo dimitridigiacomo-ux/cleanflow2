@@ -3152,7 +3152,15 @@ const getJobOperationalDuration = job =>
 const getJobOperationalStartMinutes = job => t2m(job.startTime||'00:00');
 const uid = () => { try{return crypto.randomUUID();}catch{return 'j'+Date.now().toString(36)+Math.random().toString(36).slice(2,9);} };
 const getTodayKey = () => ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date().getDay()];
-const getMondayOf = (offset=0) => { const now=new Date(); const dow=now.getDay(); const m=new Date(now); m.setDate(now.getDate()-(dow===0?6:dow-1)+offset*7); m.setHours(0,0,0,0); return m; };
+// ── REPLAY CLOCK SEAM (test/replay only) ──────────────────────────────────────
+// Internal, inactive-by-default override of "now" for the Debug Center replay harness.
+// Default null → getMondayOf reads the real wall clock, so production is byte-identical.
+// A replay run sets this to the fixture's week Monday, runs the REAL scheduler, then
+// resets to null. This is the ONLY wall-clock seam in the scheduler decision path: every
+// date flows through getWeekDates → getMondayOf. Never read/written by scheduler/optimizer/
+// repair/scoring, never persisted, never sent to backend. Set ONLY by the replay harness.
+let __CF_REPLAY_NOW = null;
+const getMondayOf = (offset=0) => { const now=__CF_REPLAY_NOW?new Date(__CF_REPLAY_NOW.getTime()):new Date(); const dow=now.getDay(); const m=new Date(now); m.setDate(now.getDate()-(dow===0?6:dow-1)+offset*7); m.setHours(0,0,0,0); return m; };
 const getWeekDates = (offset=0) => { const m=getMondayOf(offset); return DAYS.map((_,i)=>{ const d=new Date(m); d.setDate(m.getDate()+i); return d; }); };
 // Local-timezone-safe YYYY-MM-DD (avoid UTC shift on dates near midnight in Malta/Europe)
 const toISODateLocal = d => {
