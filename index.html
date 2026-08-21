@@ -2678,7 +2678,7 @@ const publishScheduleToBackend = async (weekStartISO, weekEndISO, publishedBy, j
 // ─── Operational job normalization for dirty-comparison ────────────────────
 // Compare only the fields that matter operationally. Sort deterministically so
 // reordering or non-operational metadata changes do not cause false dirty flags.
-const OPERATIONAL_FIELDS = ['id','day','dateISO','propertyId','temporaryLocationName','displayName','serviceTypeId','startTime','duration','manualEndTime','cleanerTimeOverrides','cleanersRequired','cleanerIds','priority','note','type','source','status'];
+const OPERATIONAL_FIELDS = ['id','day','dateISO','propertyId','temporaryLocationName','displayName','serviceTypeId','startTime','duration','manualEndTime','cleanerTimeOverrides','cleanersRequired','cleanerIds','priority','note','type','source','status','fallbackUsed','flexibleWindow','windowStartTime','windowEndTime','manualEdited','schedulerDecisionCode','templateLockedFromSheet','rescueUsed'];
 const normalizeJobsForCompare = (jobs) => {
   if(!Array.isArray(jobs)) return '[]';
   const normalized = jobs.map(j=>{
@@ -2693,6 +2693,17 @@ const normalizeJobsForCompare = (jobs) => {
       else if(k==='cleanerTimeOverrides'){
         const ov = (v && typeof v==='object') ? v : {};
         v = Object.keys(ov).sort().map(id=>`${id}:${ov[id]?.startTime||''}-${ov[id]?.endTime||''}`).join(',');
+      }
+      // Round-trip fix: for these four optional booleans, an absent value (undefined —
+      // dropped by JSON.stringify in a saved draft) and an explicit false (defaulted by
+      // the backend rowToJob on restore) are operationally equivalent, so both must
+      // normalize to '' — otherwise a draft-vs-restored comparison flags a false
+      // "unpublished changes". truthy still becomes 'true', so a genuine change is still
+      // detected. templateLockedFromSheet is DELIBERATELY excluded: it is tri-state
+      // (false=mutable != undefined=legacy-locked) and must keep false ('false') distinct
+      // from undefined ('') via the default branch below.
+      else if(k==='fallbackUsed' || k==='flexibleWindow' || k==='manualEdited' || k==='rescueUsed'){
+        v = v === true ? 'true' : '';
       }
       else if(v===undefined || v===null) v = '';
       else v = String(v);
