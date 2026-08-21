@@ -13295,9 +13295,9 @@ function App(){
       // copied), kept separate. meta (capturedAt) stays out of the deterministic payload.
       if(CLEANFLOW_DEBUG_CENTER_ENABLED && _replayInput){
         setLastReplayFixture({
-          schemaVersion:'cleanflow-replay-v1',
+          schemaVersion:'cleanflow-replay-v2',
           meta:{ capturedAt:new Date().toISOString(), appVersion:'', warning:'PRIVATE operational data — cleaner/property names, notes. Do not commit or upload.' },
-          input:{ ..._replayInput, weekStartISO:getWeekStartISO(weekOffset), weekEndISO:getWeekEndISO(weekOffset) },
+          input:{ ..._replayInput, weekStartISO:getWeekStartISO(weekOffset), weekEndISO:getWeekEndISO(weekOffset), startDay, endDay:endDay||'Sun' },
           expectedOutput:{ jobs: JSON.parse(JSON.stringify(finalJobs)) },
         });
       }
