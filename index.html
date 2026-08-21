@@ -9386,6 +9386,29 @@ const downloadDebugJson = (snapshot, trace=null) => {
   }
 };
 
+// Replay fixture download (Blob only, no dependency). Separate from downloadDebugJson:
+// carries ONLY input + expectedOutput + schemaVersion, never the trace. The file holds
+// private operational data (names, notes) — the button confirms before calling this.
+const downloadReplayFixture = (fixture) => {
+  if(!fixture) return false;
+  try {
+    const wk = (fixture.input && fixture.input.weekStartISO) || 'week';
+    const filename = `CleanFlow_Replay_${wk}.json`;
+    const blob = new Blob([JSON.stringify(fixture, null, 2)], { type:'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    return true;
+  } catch(e) {
+    console.error('[DebugCenter] Replay fixture download failed', e);
+    return false;
+  }
+};
+
 
 function Toast({toast}){
   if(!toast) return null;
@@ -11458,7 +11481,7 @@ function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conf
 // setJobs, runAutoSchedule, publishScheduleToBackend, saveDraft or localStorage.
 // "Aggiorna diagnostica" simply bumps a local token so the snapshot memo re-runs
 // against the CURRENT state — it does not re-schedule anything.
-const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, training, travelBuffers, showToast, dataVersion, isDesktop, onBack, debugTrace }) => {
+const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, training, travelBuffers, showToast, dataVersion, isDesktop, onBack, debugTrace, replayFixture }) => {
   const [refreshToken, setRefreshToken] = useState(0);
   // FASE 2 — read-only trace of the LAST Rigenera. "Aggiorna diagnostica" never touches it.
   const [activeTab, setActiveTab] = useState('overview');
@@ -11573,6 +11596,12 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
     const ok = downloadDebugJson(snapshot, trace);
     notify(ok ? 'Debug JSON scaricato' : 'Download non riuscito', ok ? 'ok' : 'error');
   };
+  const doDownloadReplay = () => {
+    if(!replayFixture){ notify('Nessuna fixture: premi Rigenera prima', 'warn'); return; }
+    if(!window.confirm('Questo file contiene dati operativi privati (nomi cleaner, proprietà, note). Non caricarlo su repository pubblici o servizi esterni. Continuare?')) return;
+    const ok = downloadReplayFixture(replayFixture);
+    notify(ok ? 'Fixture replay scaricata' : 'Download non riuscito', ok ? 'ok' : 'error');
+  };
 
   const card = { background:C.card, borderRadius:14, border:'1px solid #E8E2DA', padding:14, marginBottom:14 };
   const btn = (bg, fg='white', disabled=false) => ({
@@ -11614,6 +11643,7 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
           <button onClick={doCopyFull} style={btn(C.nav)}>📋 Copia report completo</button>
           <button onClick={doCopySelected} disabled={!selectedDiagnostic} style={btn(C.nav, 'white', !selectedDiagnostic)}>📋 Copia job selezionato</button>
           <button onClick={doDownload} style={btn(C.blue)}>⬇️ Scarica debug JSON</button>
+          <button onClick={doDownloadReplay} disabled={!replayFixture} style={btn(C.purple, 'white', !replayFixture)} title="Contiene dati operativi privati — non committare">⬇️ Scarica fixture replay{replayFixture ? ` · ${replayFixture.input.weekStartISO}` : ''}</button>
         </div>
         <div style={{ fontSize:11, color:C.muted, marginTop:10, lineHeight:1.5 }}>
           Questa vista è puramente diagnostica: non assegna cleaner, non modifica turni, non salva e non pubblica.
@@ -12308,6 +12338,13 @@ function App(){
   // FASE 2: trace of the LAST Rigenera only. In-memory, never persisted, never sent to
   // the backend, never part of the Publish payload / Draft / localStorage.
   const [lastDebugTrace, setLastDebugTrace] = useState(null);
+  // Replay fixture of the LAST Rigenera (in-memory, private, never persisted/published).
+  const [lastReplayFixture, setLastReplayFixture] = useState(null);
+  // The replay fixture belongs to one specific week+run. Drop it whenever the week
+  // changes, so the Debug Center can never offer a fixture from a different week.
+  // Keyed on weekOffset ONLY — tab/modal/other UI changes never alter scheduler inputs
+  // and must not discard a valid fixture. On mount this is a no-op (already null).
+  useEffect(()=>{ setLastReplayFixture(null); }, [weekOffset]);
   // Workflow state machine
   const [wf, setWf]=useState({templateLoaded:false,hostawayLoaded:false,shiftsGenerated:false,staleGeneration:false});
   // Generate gating: Sheet data + Default Template + Hostaway (API, or CSV fallback)
@@ -13205,6 +13242,11 @@ function App(){
     if(!wf.hostawayLoaded){showToast('Importa prima Hostaway API (o CSV come fallback)','warn');return;}
     if(jobs.length===0){showToast('Carica prima il template o importa da Hostaway','warn');return;}
     if(!startDay){ setGenerateResult(null); setModal('generateResult'); return; }
+    // A new generation attempt supersedes any previous replay fixture: clear it up
+    // front so a run that then FAILS cannot leave a stale fixture downloadable. Placed
+    // after the !startDay guard, so merely opening (or cancelling) the range modal —
+    // a UI action that does not touch scheduler inputs — never discards a valid fixture.
+    setLastReplayFixture(null);
     // FASE 2: declared before the try so the catch branch can finalize a 'failed' trace.
     let _debugTrace = null;
     try{
@@ -13232,6 +13274,12 @@ function App(){
         runId: _traceRunId, weekOffset,
       });
       const _traceInput = [...keepBefore,...lockedJobs,...prepared,...keepAfter];
+      // Replay fixture (read-only): deep-copy the exact PRE-scheduler input here, before
+      // runAutoSchedule, so later mutations or an 'Aggiorna dati' can never alter it.
+      // Gated on the Debug Center flag — zero cost when the Debug Center is off.
+      const _replayInput = CLEANFLOW_DEBUG_CENTER_ENABLED
+        ? JSON.parse(JSON.stringify({ weekOffset, cleaners:CLEANERS, properties:PROPERTIES, training:TRAINING, travelBuffers:TRAVEL_BUFFERS, opSettings:OP_SETTINGS, jobs:_traceInput }))
+        : null;
       if(_debugTrace.enabled){
         _debugTrace.push({ phase:'run', type:'run_started',
           message:`Run avviato — ${_traceInput.length} job in ingresso`, data:{ runId:_traceRunId } });
@@ -13243,6 +13291,16 @@ function App(){
         ...result.jobs.filter(j=>{const i=DAYS.indexOf(j.day);return i>=startIdx&&i<=endIdx&&!(j.type==='template'&&lockedJobs.some(l=>l.id===j.id));}),
         ...keepAfter,
       ];
+      // Replay fixture: pair the pre-scheduler input with the scheduled output (deep-
+      // copied), kept separate. meta (capturedAt) stays out of the deterministic payload.
+      if(CLEANFLOW_DEBUG_CENTER_ENABLED && _replayInput){
+        setLastReplayFixture({
+          schemaVersion:'cleanflow-replay-v1',
+          meta:{ capturedAt:new Date().toISOString(), appVersion:'', warning:'PRIVATE operational data — cleaner/property names, notes. Do not commit or upload.' },
+          input:{ ..._replayInput, weekStartISO:getWeekStartISO(weekOffset), weekEndISO:getWeekEndISO(weekOffset) },
+          expectedOutput:{ jobs: JSON.parse(JSON.stringify(finalJobs)) },
+        });
+      }
       if(_debugTrace.enabled){
         _debugTrace.push({ phase:'run', type:'run_completed', message:'Run completato' });
         const _tc = detectConflicts(finalJobs);
@@ -13726,6 +13784,7 @@ function App(){
         cleaners={CLEANERS} properties={PROPERTIES} training={TRAINING} travelBuffers={TRAVEL_BUFFERS}
         showToast={showToast} dataVersion={dataVersion} isDesktop={isDesktop}
         debugTrace={lastDebugTrace}
+        replayFixture={lastReplayFixture}
         onBack={()=>setTab('week')}/>}
     </div>
   );
