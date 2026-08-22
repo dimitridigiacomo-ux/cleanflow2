@@ -9416,6 +9416,180 @@ const downloadReplayFixture = (fixture) => {
     return false;
   }
 };
+// ── FASE 2 — SCHEDULER REPLAY HARNESS (read-only) ──────────────────────────────
+// Re-runs the REAL scheduler on a saved cleanflow-replay-v2 fixture and diffs the
+// result against expectedOutput.jobs. It NEVER touches React state, the network,
+// localStorage, the Sheet, or setJobs. Every module global it swaps in (CLEANERS,
+// PROPERTIES, TRAINING, TRAVEL_BUFFERS, OP_SETTINGS) plus the clock seam
+// (__CF_REPLAY_NOW) is restored in `finally`, including on error or early return.
+// Jobs are paired via the existing diagnostic key (buildDebugIndexedJobs) so no job is
+// ever collapsed or lost, even with empty/duplicate ids. The diff shows VALUES only for
+// an allowlist of technical fields; every other field (names, notes, ids, free text) is
+// reported as "differs" with no value, and jobs are labelled by (row · day), never id.
+
+// Fields whose VALUES are safe to display: enums, booleans, numbers, times, dates,
+// day-of-week, and internal cleaner references. Everything else (id, propertyId,
+// displayName, temporaryLocationName, note, any unknown field) is reported as a bare
+// "valore differente" with no expected/actual value ever leaving the harness.
+const REPLAY_SAFE_FIELDS = new Set(['day','dateISO','serviceTypeId','startTime','manualEndTime','windowStartTime','windowEndTime','duration','cleanersRequired','cleanerIds','cleanerTimeOverrides','priority','type','source','status','fallbackUsed','flexibleWindow','manualEdited','schedulerDecisionCode','templateLockedFromSheet','rescueUsed']);
+// Arrays are compared order-SENSITIVELY by default (order can carry a regression).
+// Only these fields are semantically order-insensitive and get sorted before compare.
+const REPLAY_ORDER_INSENSITIVE_FIELDS = new Set(['cleanerIds']);
+const isPlainObjectRP = o => o!==null && typeof o==='object' && !Array.isArray(o);
+// Parse a strict YYYY-MM-DD as a LOCAL date, REJECTING calendar normalization
+// (e.g. 2026-02-31 -> null, never silently rolled forward to March).
+const parseStrictISO = (s) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof s==='string' ? s : '');
+  if(!m) return null;
+  const y=+m[1], mo=+m[2], d=+m[3];
+  const dt = new Date(y, mo-1, d);
+  if(dt.getFullYear()!==y || dt.getMonth()!==mo-1 || dt.getDate()!==d) return null;
+  dt.setHours(0,0,0,0);
+  return dt;
+};
+const validateReplayFixture = (fx) => {
+  if(!isPlainObjectRP(fx)) return { ok:false, error:'il file non è un oggetto JSON' };
+  if(fx.schemaVersion!=='cleanflow-replay-v2') return { ok:false, error:`schemaVersion atteso 'cleanflow-replay-v2', trovato ${JSON.stringify(fx.schemaVersion)}` };
+  const inp = fx.input;
+  if(!isPlainObjectRP(inp)) return { ok:false, error:'manca input (oggetto)' };
+  if(!isPlainObjectRP(fx.expectedOutput)) return { ok:false, error:'manca expectedOutput (oggetto)' };
+  if(!Array.isArray(fx.expectedOutput.jobs)) return { ok:false, error:'manca expectedOutput.jobs (array)' };
+  if(!Array.isArray(inp.jobs)) return { ok:false, error:'manca input.jobs (array)' };
+  if(!DAYS.includes(inp.startDay)) return { ok:false, error:`startDay non valido: ${JSON.stringify(inp.startDay)}` };
+  if(!DAYS.includes(inp.endDay)) return { ok:false, error:`endDay non valido: ${JSON.stringify(inp.endDay)}` };
+  if(DAYS.indexOf(inp.startDay) > DAYS.indexOf(inp.endDay)) return { ok:false, error:`startDay (${inp.startDay}) successivo a endDay (${inp.endDay})` };
+  const startDt = parseStrictISO(inp.weekStartISO);
+  if(!startDt) return { ok:false, error:`weekStartISO non è una data reale YYYY-MM-DD: ${JSON.stringify(inp.weekStartISO)}` };
+  const endDt = parseStrictISO(inp.weekEndISO);
+  if(!endDt) return { ok:false, error:`weekEndISO non è una data reale YYYY-MM-DD: ${JSON.stringify(inp.weekEndISO)}` };
+  if(startDt.getDay()!==1) return { ok:false, error:`weekStartISO non è un lunedì: ${inp.weekStartISO}` };
+  const expectedEnd = new Date(startDt); expectedEnd.setDate(startDt.getDate()+6);
+  if(endDt.getTime()!==expectedEnd.getTime()) return { ok:false, error:`weekEndISO deve essere esattamente 6 giorni dopo weekStartISO (atteso ${toISODateLocal(expectedEnd)}), trovato ${inp.weekEndISO}` };
+  if(!Number.isInteger(inp.weekOffset)) return { ok:false, error:`weekOffset non intero: ${JSON.stringify(inp.weekOffset)}` };
+  if(!Array.isArray(inp.cleaners)) return { ok:false, error:'input.cleaners deve essere un array' };
+  if(!Array.isArray(inp.properties)) return { ok:false, error:'input.properties deve essere un array' };
+  if(!isPlainObjectRP(inp.training)) return { ok:false, error:'input.training deve essere un oggetto' };
+  if(!isPlainObjectRP(inp.travelBuffers)) return { ok:false, error:'input.travelBuffers deve essere un oggetto' };
+  if(!isPlainObjectRP(inp.opSettings)) return { ok:false, error:'input.opSettings deve essere un oggetto' };
+  // Validate the numeric actually read by the decision path (OP_SETTINGS.defaultTravelBufferMinutes).
+  // MUST be a finite JSON number — reject '', null, and numeric strings like '15'.
+  const dtb = inp.opSettings.defaultTravelBufferMinutes;
+  if(typeof dtb !== 'number' || !Number.isFinite(dtb)) return { ok:false, error:`input.opSettings.defaultTravelBufferMinutes deve essere un numero JSON finito, trovato ${JSON.stringify(dtb)}` };
+  return { ok:true };
+};
+// Deterministic, TYPE-SENSITIVE value serialization. undefined and null are distinct;
+// a primitive is tagged with its typeof so number 1 ≠ string "1" and boolean false ≠
+// string "false". Arrays keep their order (order can be a regression); objects are
+// sorted-key (JS object key order is not semantic).
+const canonReplayVal = (v) => {
+  if(v===undefined) return 'undefined';
+  if(v===null) return 'null';
+  if(Array.isArray(v)) return '['+v.map(canonReplayVal).join(',')+']';
+  if(typeof v==='object') return '{'+Object.keys(v).sort().map(k=>k+':'+canonReplayVal(v[k])).join(',')+'}';
+  return typeof v+':'+String(v);
+};
+// Field-aware serialization: only order-insensitive fields (cleanerIds) are sorted.
+const canonReplayField = (k, v) => {
+  if(REPLAY_ORDER_INSENSITIVE_FIELDS.has(k) && Array.isArray(v)) return canonReplayVal([...v].map(String).sort());
+  return canonReplayVal(v);
+};
+const diffReplayJobs = (expected, actual) => {
+  // Reuse the existing DIAGNOSTIC-ONLY key derivation: unique within each array even for
+  // empty/duplicated ids, deterministic, index-based ONLY as a fallback for non-unique
+  // ids. No job is ever collapsed or lost, so a duplicate id can never fake a PASS.
+  const eIdx = buildDebugIndexedJobs(expected);
+  const aIdx = buildDebugIndexedJobs(actual);
+  const em = new Map(eIdx.map(e=>[e.debugKey, e]));
+  const am = new Map(aIdx.map(e=>[e.debugKey, e]));
+  // Safe, non-personal label: row position + day-of-week. NEVER the raw id.
+  const labelOf = e => `#${e.sourceIndex}·${(e.job && e.job.day) || '?'}`;
+  const keys = [...new Set([...em.keys(), ...am.keys()])].sort();
+  const missingInActual=[], extraInActual=[], fieldDiffs=[];
+  const rank = k => { const i=OPERATIONAL_FIELDS.indexOf(k); return i<0?OPERATIONAL_FIELDS.length:i; };
+  for(const key of keys){
+    const e=em.get(key), a=am.get(key);
+    if(e && !a){ missingInActual.push(labelOf(e)); continue; }
+    if(a && !e){ extraInActual.push(labelOf(a)); continue; }
+    const ej=e.job, aj=a.job;
+    const fields=[...new Set([...Object.keys(ej), ...Object.keys(aj)])]
+      .sort((x,y)=>{ const rx=rank(x), ry=rank(y); return rx!==ry?rx-ry:(x<y?-1:x>y?1:0); });
+    for(const f of fields){
+      const ce=canonReplayField(f, ej[f]), ca=canonReplayField(f, aj[f]);
+      if(ce!==ca){
+        if(REPLAY_SAFE_FIELDS.has(f)) fieldDiffs.push({ jobLabel:labelOf(e), field:f, expected:ce, actual:ca });
+        else fieldDiffs.push({ jobLabel:labelOf(e), field:f, differs:true });
+      }
+    }
+  }
+  // Explicit integrity signals (counts + safe labels only; never the raw id string).
+  const dupLabels = [
+    ...eIdx.filter(e=>e.duplicateId).map(e=>'exp '+labelOf(e)),
+    ...aIdx.filter(e=>e.duplicateId).map(e=>'act '+labelOf(e)),
+  ];
+  const missingIdCount = eIdx.filter(e=>!e.rawId).length + aIdx.filter(e=>!e.rawId).length;
+  const totalDiffs = missingInActual.length + extraInActual.length + fieldDiffs.length;
+  return { pass: totalDiffs===0, totalDiffs, jobCountExpected:expected.length, jobCountActual:actual.length,
+           missingInActual, extraInActual, fieldDiffs,
+           duplicateIdCount: dupLabels.length, duplicateIdLabels: dupLabels, missingIdCount };
+};
+const runReplayFixture = (rawFixture) => {
+  const v = validateReplayFixture(rawFixture);
+  if(!v.ok) return { ok:false, phase:'validation', error:v.error };
+  // Deep-copy so repeated runs are independent and the loaded fixture (whose
+  // expectedOutput we diff against) is never mutated by the scheduler.
+  const fx = JSON.parse(JSON.stringify(rawFixture));
+  const input = fx.input;
+  // Snapshot EVERY global the decision path reads, plus the clock seam.
+  const savedCleaners=CLEANERS, savedProps=PROPERTIES, savedTraining=TRAINING,
+        savedBuffers=TRAVEL_BUFFERS, savedNow=__CF_REPLAY_NOW;
+  const savedOp = JSON.parse(JSON.stringify(OP_SETTINGS));
+  try {
+    // CLOCK PIN — anchor a Monday so getWeekStartISO(weekOffset) === input.weekStartISO.
+    // anchorMonday = weekStartISO − weekOffset×7 days (NOT weekStartISO directly).
+    const [Y,Mo,Da] = input.weekStartISO.split('-').map(Number);
+    const anchor = new Date(Y, Mo-1, Da);            // local midnight, no UTC shift
+    anchor.setDate(anchor.getDate() - input.weekOffset*7);
+    anchor.setHours(0,0,0,0);
+    __CF_REPLAY_NOW = anchor;
+    // MANDATORY assertion BEFORE the scheduler runs.
+    const gotISO = getWeekStartISO(input.weekOffset);
+    if(gotISO !== input.weekStartISO){
+      return { ok:false, phase:'clock', error:`clock pin fallito: getWeekStartISO(${input.weekOffset})=${gotISO} ≠ weekStartISO=${input.weekStartISO}` };
+    }
+    // Swap the domain globals with the fixture inputs.
+    CLEANERS = input.cleaners; PROPERTIES = input.properties;
+    TRAINING = input.training; TRAVEL_BUFFERS = input.travelBuffers;
+    for(const k of Object.keys(OP_SETTINGS)) delete OP_SETTINGS[k];
+    Object.assign(OP_SETTINGS, input.opSettings || {});
+    // Run the REAL scheduler (empty opts: production path minus diagnostics/trace).
+    const result = runAutoSchedule(input.jobs, input.weekOffset, {});
+    // Rebuild finalJobs EXACTLY as handleGenerate does: same startDay/endDay slicing,
+    // keepBefore/keepAfter passthrough, locked-template preservation.
+    const isFullyAssigned = job => (job.cleanerIds||[]).length >= getJobRequiredCleaners(job);
+    const startIdx = DAYS.indexOf(input.startDay);
+    const endIdx = input.endDay ? DAYS.indexOf(input.endDay) : 6;
+    const jobsIn = input.jobs;
+    const keepBefore = jobsIn.filter(j=>DAYS.indexOf(j.day)<startIdx);
+    const keepAfter  = jobsIn.filter(j=>DAYS.indexOf(j.day)>endIdx);
+    const lockedJobs = jobsIn.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && j.type==='template' && isFullyAssigned(j); });
+    const actualFinal = [
+      ...keepBefore,
+      ...lockedJobs.map(j=>({...j,status:isFullyAssigned(j)?'assigned':'needs_review'})),
+      ...result.jobs.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && !(j.type==='template' && lockedJobs.some(l=>l.id===j.id)); }),
+      ...keepAfter,
+    ];
+    const diff = diffReplayJobs(fx.expectedOutput.jobs, actualFinal);
+    return { ok:true, phase:'done', ...diff };
+  } catch(e){
+    return { ok:false, phase:'run', error:String((e&&e.message)||e) };
+  } finally {
+    // Restore EVERYTHING, even on error / early return.
+    CLEANERS=savedCleaners; PROPERTIES=savedProps; TRAINING=savedTraining; TRAVEL_BUFFERS=savedBuffers;
+    for(const k of Object.keys(OP_SETTINGS)) delete OP_SETTINGS[k];
+    Object.assign(OP_SETTINGS, savedOp);
+    __CF_REPLAY_NOW = savedNow;
+  }
+};
 
 
 function Toast({toast}){
@@ -11506,6 +11680,11 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
   const [selectedDebugKey, setSelectedDebugKey] = useState(null);
   const [listFilter, setListFilter] = useState('problems');
   const [eligFilter, setEligFilter] = useState('all');
+  // FASE 2 — Replay harness (read-only). Loaded fixture + last result live here only;
+  // running never touches React state, network, storage, or the Sheet.
+  const [replayLoaded, setReplayLoaded] = useState(null);
+  const [replayResult, setReplayResult] = useState(null);
+  const [replayBusy, setReplayBusy] = useState(false);
 
   const snapshot = useMemo(
     () => buildDebugSnapshot({ jobs, weekOffset, conflicts, cleaners, properties, training, travelBuffers }),
@@ -11610,6 +11789,40 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
     const ok = downloadReplayFixture(replayFixture);
     notify(ok ? 'Fixture replay scaricata' : 'Download non riuscito', ok ? 'ok' : 'error');
   };
+  const handleReplayFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // allow re-picking the same file
+    setReplayResult(null); setReplayLoaded(null);
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const fx = JSON.parse(String(reader.result));
+        const val = validateReplayFixture(fx);
+        if(!val.ok){ notify('Fixture non valida: '+val.error, 'error'); return; }
+        setReplayLoaded(fx);
+        notify(`Fixture caricata · ${fx.input.weekStartISO} · ${fx.input.jobs.length} job`, 'ok');
+      } catch(err){ notify('JSON non parsabile: '+((err&&err.message)||err), 'error'); }
+    };
+    reader.onerror = () => notify('Lettura file non riuscita', 'error');
+    reader.readAsText(file);
+  };
+  const doRunReplay = () => {
+    if(!replayLoaded){ notify('Carica prima una fixture v2', 'warn'); return; }
+    setReplayBusy(true);
+    // Defer so the "busy" state can paint before the synchronous scheduler run.
+    setTimeout(() => {
+      try {
+        const res = runReplayFixture(replayLoaded);
+        setReplayResult(res);
+        if(!res.ok) notify('Replay non eseguito: '+res.error, 'error');
+        else notify(res.pass ? 'Replay PASS — output identico' : `Replay FAIL · ${res.totalDiffs} differenze`, res.pass?'ok':'error');
+      } catch(err){
+        setReplayResult({ ok:false, phase:'harness', error:String((err&&err.message)||err) });
+        notify('Errore harness: '+((err&&err.message)||err), 'error');
+      } finally { setReplayBusy(false); }
+    }, 0);
+  };
 
   const card = { background:C.card, borderRadius:14, border:'1px solid #E8E2DA', padding:14, marginBottom:14 };
   const btn = (bg, fg='white', disabled=false) => ({
@@ -11655,6 +11868,89 @@ const DebugCenter = ({ jobs, weekOffset, conflicts, cleaners, properties, traini
         </div>
         <div style={{ fontSize:11, color:C.muted, marginTop:10, lineHeight:1.5 }}>
           Questa vista è puramente diagnostica: non assegna cleaner, non modifica turni, non salva e non pubblica.
+        </div>
+      </div>
+
+      {/* FASE 2 — REPLAY HARNESS */}
+      <div style={card}>
+        <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:8 }}>
+          <div style={{ fontFamily:"'Syne',sans-serif", fontSize:15, fontWeight:800, color:C.text }}>🔁 Replay scheduler (fixture v2)</div>
+          <span style={{ fontSize:10, fontWeight:800, padding:'3px 8px', borderRadius:6, background:'#F3E8FF', color:'#6B21A8' }}>READ-ONLY · NIENTE RETE/STORAGE</span>
+        </div>
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap', alignItems:'center' }}>
+          <label style={{ ...btn(C.nav), display:'inline-block' }}>
+            📂 Scegli fixture…
+            <input type="file" accept="application/json,.json" onChange={handleReplayFile} style={{ display:'none' }} />
+          </label>
+          <button onClick={doRunReplay} disabled={!replayLoaded || replayBusy} style={btn(C.purple, 'white', !replayLoaded || replayBusy)}>
+            {replayBusy ? '⏳ Esecuzione…' : '▶️ Esegui replay'}
+          </button>
+          {replayLoaded && (
+            <span style={{ fontSize:11, color:C.muted }}>
+              Caricata · {replayLoaded.input.weekStartISO} → {replayLoaded.input.weekEndISO} · offset {replayLoaded.input.weekOffset} · {replayLoaded.input.startDay}–{replayLoaded.input.endDay} · {replayLoaded.input.jobs.length} job
+            </span>
+          )}
+        </div>
+        {replayResult && !replayResult.ok && (
+          <div style={{ marginTop:10, padding:'10px 12px', borderRadius:10, background:'#FEF2F2', border:'1px solid #FECACA', color:C.conflict, fontSize:12, fontWeight:700 }}>
+            ⚠️ Replay non eseguito ({replayResult.phase}): {replayResult.error}
+          </div>
+        )}
+        {replayResult && replayResult.ok && (
+          <div style={{ marginTop:10 }}>
+            <div style={{ display:'inline-block', padding:'6px 12px', borderRadius:8, fontWeight:800, fontSize:13,
+              background: replayResult.pass ? '#DCFCE7' : '#FEE2E2', color: replayResult.pass ? '#166534' : '#991B1B' }}>
+              {replayResult.pass ? '✅ PASS — output identico' : `❌ FAIL — ${replayResult.totalDiffs} differenze`}
+            </div>
+            <div style={{ fontSize:11, color:C.muted, marginTop:6 }}>
+              job attesi: {replayResult.jobCountExpected} · job prodotti: {replayResult.jobCountActual}
+              {replayResult.missingInActual.length>0 && ` · mancanti: ${replayResult.missingInActual.length}`}
+              {replayResult.extraInActual.length>0 && ` · in più: ${replayResult.extraInActual.length}`}
+              {` · campi differenti: ${replayResult.fieldDiffs.length}`}
+            </div>
+            {(replayResult.duplicateIdCount>0 || replayResult.missingIdCount>0) && (
+              <div style={{ fontSize:11, color:C.warn, marginTop:6, fontWeight:700 }}>
+                ⚠ integrità id: {replayResult.duplicateIdCount} job con id duplicato{replayResult.duplicateIdLabels.length>0 ? ` (${replayResult.duplicateIdLabels.slice(0,20).join(', ')})` : ''} · {replayResult.missingIdCount} job senza id — confronto posizionale per questi.
+              </div>
+            )}
+            {!replayResult.pass && (
+              <div style={{ marginTop:8, maxHeight:240, overflow:'auto', border:'1px solid #E8E2DA', borderRadius:8 }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead><tr>
+                    <th style={th}>Job (riga·giorno)</th><th style={th}>Campo</th><th style={th}>Atteso</th><th style={th}>Prodotto</th>
+                  </tr></thead>
+                  <tbody>
+                    {replayResult.missingInActual.slice(0,200).map((lbl,i)=>(
+                      <tr key={'m'+i}><td style={td}>{lbl}</td><td style={td} colSpan={3}><em>assente nell'output prodotto</em></td></tr>
+                    ))}
+                    {replayResult.extraInActual.slice(0,200).map((lbl,i)=>(
+                      <tr key={'e'+i}><td style={td}>{lbl}</td><td style={td} colSpan={3}><em>presente solo nell'output prodotto</em></td></tr>
+                    ))}
+                    {replayResult.fieldDiffs.slice(0,200).map((d,i)=>(
+                      <tr key={'f'+i}>
+                        <td style={{...td, fontFamily:'monospace'}}>{d.jobLabel}</td>
+                        <td style={{...td, fontWeight:700}}>{d.field}</td>
+                        {d.differs
+                          ? <td style={{...td, color:C.muted, fontStyle:'italic'}} colSpan={2}>valore differente (nascosto per privacy)</td>
+                          : <>
+                              <td style={{...td, fontFamily:'monospace', color:C.muted}}>{d.expected}</td>
+                              <td style={{...td, fontFamily:'monospace', color:C.conflict}}>{d.actual}</td>
+                            </>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {(replayResult.fieldDiffs.length>200 || replayResult.missingInActual.length>200 || replayResult.extraInActual.length>200) && (
+                  <div style={{ padding:'6px 8px', fontSize:11, color:C.muted }}>
+                    Anteprima limitata a 200 righe per categoria — conteggio totale differenze: {replayResult.totalDiffs}.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{ fontSize:11, color:C.muted, marginTop:10, lineHeight:1.5 }}>
+          Riesegue lo scheduler reale sugli input della fixture con orologio ancorato in modo deterministico, poi confronta con l'output atteso. Mostra i valori solo per campi tecnici allowlisted; per gli altri segnala soltanto "valore differente". Non tocca i turni correnti, la rete, lo storage o il foglio.
         </div>
       </div>
 
