@@ -5524,6 +5524,155 @@ const buildCombinations = (pool, size, maxResults) => {
 // TRACE (Fase 2): optional 4th argument — the collector created at the Rigenera call
 // site. It is only forwarded to repairRemainingCoverageGaps; nothing in the optimizer
 // reads it. Default undefined keeps every existing call site working unchanged.
+// ── FINAL FAIRNESS REBALANCE PASS (inert by default) ───────────────────────────
+// Runs AFTER coverage is complete (optimizer + repair). Moves ONLY mutable jobs
+// (locked/manual/rescue untouched via isMutableSchedulerJob). Objective is fairness
+// only — (underHrs, sumDev), normalized on each cleaner's target (min(30, 0.75*cap));
+// days/rest are NOT an acceptance criterion. Reuses the REAL gates (canAddCleanerInPlan,
+// buildOptimizerMaps, detectConflicts, gender/senior requirement, caps) — no duplicated
+// constraint logic.
+// ID-SAFETY: jobs are addressed EXCLUSIVELY by their stable position in the plan array
+// (index), never by job.id (which can be empty or duplicated) — cache, candidate keys,
+// substitutions and swaps all use the index; a move mutates only the selected index.
+// ACCEPTANCE: not aggregate counts. A candidate is rejected if it introduces ANY new
+// detectConflicts issue (keyed by job-index + cleaner + type, via a per-index synthetic
+// id so duplicate/empty ids never collide) OR any new per-cleaner daily/weekly/maxDays
+// offender. Removing existing issues is allowed; swapping one for another at equal count
+// is not. Since a move changes only the selected index(es) and its cleaners, the barrier
+// is evaluated on exactly the AFFECTED cleaners + changed indices (a new issue can only
+// involve those) using the REAL detectConflicts on that subset — same decision as a full
+// scan, far cheaper. Two-strategy safeguard: a stable-only run and a scarcity-aware run
+// (real getMaleScarcityPenalty/getSeniorScarcityPenalty as an exact-fairness-parity
+// tie-break), then keep the lexicographically fairest result, breaking ties by lower
+// scarcity penalty then a stable choice. Off by default → production output byte-identical.
+const CLEANFLOW_FAIRNESS_PASS_ENABLED = false;
+const FAIRNESS_MOVE_CAP = 8;
+const fairnessRebalancePass = (finalJobs, weekOffset, opts={}) => {
+  const t0 = (typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now();
+  const constraints = opts.constraints || buildConstraints(weekOffset);
+  const moveCap = opts.moveCap!=null ? opts.moveCap : FAIRNESS_MOVE_CAP;
+  const capOf = c => Math.max(1,(constraints[c.id]?.maxWeeklyHrs||0)>0?constraints[c.id].maxWeeklyHrs:(Number(c.weeklyHrs)||40));
+  const tgt={}, days5={}, daysSet={}, trainSet={};
+  CLEANERS.forEach(c=>{const cp=capOf(c);tgt[c.id]=Math.min(30,cp*0.75);days5[c.id]=(c.days||[]).length>=5;daysSet[c.id]=new Set(c.days||[]);trainSet[c.id]=new Set((TRAINING[c.id]||[]).map(String));});
+  const clById = new Map(CLEANERS.map(c=>[c.id,c]));
+  const idsOf = j => dedupeCleanerIds(j.cleanerIds||[]);
+  const malePen = (id,j)=>getMaleScarcityPenalty(clById.get(id),j);
+  const senPen = (id,j)=>getSeniorScarcityPenalty(clById.get(id),j);
+  const usedOfArr = jobs => {const u={};CLEANERS.forEach(c=>u[c.id]=0);jobs.forEach(j=>idsOf(j).forEach(id=>{if(u[id]!==undefined)u[id]+=getCleanerEffectiveJobDuration(j,id);}));return u;};
+  const obj = used => {let underHrs=0,sumDev=0;CLEANERS.forEach(c=>{const t=tgt[c.id],u=used[c.id]||0;sumDev+=Math.abs(u-t);if(u<t&&days5[c.id])underHrs+=t-u;});return{underHrs:Math.round(underHrs*10)/10,sumDev:Math.round(sumDev*10)/10};};
+  const strictLess = (a,b)=>Math.abs(a.underHrs-b.underHrs)>1e-6?a.underHrs<b.underHrs:(Math.abs(a.sumDev-b.sumDev)>1e-6?a.sumDev<b.sumDev:false);
+  const totalScarcity = jobs => {let s=0;jobs.forEach(j=>idsOf(j).forEach(id=>{s+=malePen(id,j)+senPen(id,j);}));return s;};
+  const introducesNew = (after, before) => { for(const s of after) if(!before.has(s)) return true; return false; };
+  // Scoped real-conflict signature: run REAL detectConflicts over the subset of jobs that
+  // involve any AFFECTED cleaner (plus the changed indices), tagging each with its plan
+  // index so duplicate/empty ids never collide. Keep only signatures that involve an
+  // affected cleaner or a changed index — the only ones a move can create.
+  const scopedSig = (arr, affSet, changedIdx) => {
+    const sub=[]; for(let i=0;i<arr.length;i++){ const ids=arr[i].cleanerIds||[]; if(changedIdx.has(i)||ids.some(c=>affSet.has(c))) sub.push({...arr[i],id:'__fi_'+i}); }
+    const dc=detectConflicts(sub); const set=new Set();
+    dc.forEach((iss,sid)=>{ const idx=+sid.slice(5); (iss||[]).forEach(is=>{ if((is.cId&&affSet.has(is.cId))||(!is.cId&&changedIdx.has(idx))) set.add(sid+'|'+(is.cId||'')+'|'+is.type); }); });
+    return set;
+  };
+  // Scoped workload offenders for the AFFECTED cleaners only (real caps).
+  const scopedOff = (arr, affArr) => {
+    const set=new Set();
+    for(const cid of affArr){ const c=clById.get(cid); if(!c)continue;
+      let wk=0; const daily={}; const wd=new Set();
+      for(const j of arr){ if((j.cleanerIds||[]).includes(cid)){ const d=getCleanerEffectiveJobDuration(j,cid); wk+=d; daily[j.day]=(daily[j.day]||0)+d; wd.add(j.day); } }
+      const wLim=(constraints[cid]?.maxWeeklyHrs||0)>0?constraints[cid].maxWeeklyHrs:(Number(c.weeklyHrs)||0);
+      if(wLim>0&&wk>wLim) set.add(cid+'|weekly');
+      const dl=getEffectiveDailyLimit(c,constraints);
+      for(const d in daily) if(daily[d]>dl) set.add(cid+'|daily|'+d);
+      if(wd.size>getEffectiveMaxWorkedDays(c)) set.add(cid+'|maxDays');
+    }
+    return set;
+  };
+  const runStrategy = (base, scarcityAware) => {
+    let jobs = base.map(j=>({...j,cleanerIds:[...(j.cleanerIds||[])]}));
+    const N = jobs.length;
+    const meta = jobs.map(j=>({req:getJobRequiredCleaners(j),mut:isMutableSchedulerJob(j),needsTrain:!!j.propertyId,day:j.day,pid:j.propertyId}));
+    const durCache = new Map();
+    const dur = (idx,id)=>{const k=idx+'|'+id;let v=durCache.get(k);if(v===undefined){v=getCleanerEffectiveJobDuration(jobs[idx],id);durCache.set(k,v);}return v;};
+    let moves=0,subs=0,swaps=0;
+    for(let mv=0; mv<moveCap; mv++){
+      const used=usedOfArr(jobs); const curObj=obj(used);
+      const under=id=>(used[id]||0)<tgt[id], over=id=>(used[id]||0)>tgt[id];
+      const mutIdx=[]; for(let i=0;i<N;i++) if(meta[i].mut) mutIdx.push(i);
+      const cands=[];
+      for(const Ji of mutIdx){ const C=meta[Ji]; const ids=idsOf(jobs[Ji]);
+        for(const X of ids){ if(!over(X))continue;
+          for(const Yc of CLEANERS){ const Y=Yc.id; if(ids.includes(Y)||!under(Y))continue; if(!isCleanerAutoSchedulable(Yc))continue;
+            if(C.needsTrain&&!trainSet[Y].has(String(C.pid)))continue; if(!daysSet[Y].has(C.day))continue;
+            const nu={...used}; nu[X]=(nu[X]||0)-dur(Ji,X); nu[Y]=(nu[Y]||0)+dur(Ji,Y);
+            const o=obj(nu); if(!strictLess(o,curObj))continue;
+            const J=jobs[Ji]; const scar=(malePen(Y,J)+senPen(Y,J))-(malePen(X,J)+senPen(X,J));
+            cands.push({o,scar,key:'s|'+Ji+'|'+X+'|'+Y,kind:'sub',Ji,X,Y});
+          }
+        }
+      }
+      for(let a=0;a<mutIdx.length;a++){ const Jai=mutIdx[a],Ca=meta[Jai],ia=idsOf(jobs[Jai]);
+        for(const Xa of ia){
+          for(let b=a+1;b<mutIdx.length;b++){ const Jbi=mutIdx[b],Cb=meta[Jbi],ib=idsOf(jobs[Jbi]);
+            for(const Xb of ib){ if(Xa===Xb||ia.includes(Xb)||ib.includes(Xa))continue;
+              if(!(over(Xa)||over(Xb)))continue; if(!(under(Xa)||under(Xb)))continue;
+              if(!isCleanerAutoSchedulable(clById.get(Xa))||!isCleanerAutoSchedulable(clById.get(Xb)))continue;
+              if(Cb.needsTrain&&!trainSet[Xa].has(String(Cb.pid)))continue; if(Ca.needsTrain&&!trainSet[Xb].has(String(Ca.pid)))continue;
+              if(!daysSet[Xa].has(Cb.day)||!daysSet[Xb].has(Ca.day))continue;
+              const nu={...used}; nu[Xa]=(nu[Xa]||0)-dur(Jai,Xa)+dur(Jbi,Xa); nu[Xb]=(nu[Xb]||0)-dur(Jbi,Xb)+dur(Jai,Xb);
+              const o=obj(nu); if(!strictLess(o,curObj))continue;
+              const A=jobs[Jai], B=jobs[Jbi];
+              const scar=((malePen(Xb,A)+senPen(Xb,A))-(malePen(Xa,A)+senPen(Xa,A)))+((malePen(Xa,B)+senPen(Xa,B))-(malePen(Xb,B)+senPen(Xb,B)));
+              cands.push({o,scar,key:'w|'+Jai+'|'+Jbi+'|'+Xa+'|'+Xb,kind:'swap',Jai,Jbi,Xa,Xb});
+            }
+          }
+        }
+      }
+      cands.sort((a,b)=>a.o.underHrs-b.o.underHrs||a.o.sumDev-b.o.sumDev||(scarcityAware?(a.scar-b.scar):0)||(a.key<b.key?-1:1));
+      const roundMaps = buildOptimizerMaps(jobs,constraints);
+      let chosen=null;
+      for(const cn of cands){
+        let cj=null, aff=null, changed=null;
+        if(cn.kind==='sub'){ const J=jobs[cn.Ji], ids=idsOf(J);
+          const newIds=dedupeCleanerIds([...ids.filter(i=>i!==cn.X),cn.Y]); if(newIds.length!==meta[cn.Ji].req)continue;
+          if(!genderRequirementMet(J,newIds)||!seniorRequirementMet(J,newIds))continue;
+          if(!canAddCleanerInPlan(clById.get(cn.Y),J,roundMaps,constraints))continue;
+          cj=jobs.map((j,i)=>i===cn.Ji?{...j,cleanerIds:newIds}:j);
+          aff=new Set([cn.X,cn.Y]); changed=new Set([cn.Ji]);
+        } else { const A=jobs[cn.Jai], B=jobs[cn.Jbi], ia=idsOf(A), ib=idsOf(B);
+          const nA=dedupeCleanerIds([...ia.filter(i=>i!==cn.Xa),cn.Xb]),nB=dedupeCleanerIds([...ib.filter(i=>i!==cn.Xb),cn.Xa]);
+          if(nA.length!==meta[cn.Jai].req||nB.length!==meta[cn.Jbi].req)continue;
+          if(!genderRequirementMet(A,nA)||!seniorRequirementMet(A,nA)||!genderRequirementMet(B,nB)||!seniorRequirementMet(B,nB))continue;
+          const strip=jobs.map((j,i)=>i===cn.Jai?{...j,cleanerIds:ia.filter(x=>x!==cn.Xa)}:i===cn.Jbi?{...j,cleanerIds:ib.filter(x=>x!==cn.Xb)}:j);
+          const m2=buildOptimizerMaps(strip,constraints);
+          if(!canAddCleanerInPlan(clById.get(cn.Xa),B,m2,constraints)||!canAddCleanerInPlan(clById.get(cn.Xb),A,m2,constraints))continue;
+          cj=jobs.map((j,i)=>i===cn.Jai?{...j,cleanerIds:nA}:i===cn.Jbi?{...j,cleanerIds:nB}:j);
+          aff=new Set([cn.Xa,cn.Xb]); changed=new Set([cn.Jai,cn.Jbi]);
+        }
+        // ACCEPTANCE barrier (scoped to affected cleaners + changed indices).
+        if(introducesNew(scopedSig(cj,aff,changed), scopedSig(jobs,aff,changed)))continue;
+        if(introducesNew(scopedOff(cj,[...aff]), scopedOff(jobs,[...aff])))continue;
+        chosen={jobs:cj,kind:cn.kind}; break;
+      }
+      if(!chosen)break; jobs=chosen.jobs; moves++; if(chosen.kind==='sub')subs++;else swaps++;
+    }
+    return {jobs,moves,subs,swaps,finalObj:obj(usedOfArr(jobs))};
+  };
+  const base = finalJobs;
+  const stable = runStrategy(base, false);
+  const scar = runStrategy(base, true);
+  let winner;
+  if(strictLess(scar.finalObj, stable.finalObj)) winner = scar;
+  else if(strictLess(stable.finalObj, scar.finalObj)) winner = stable;
+  else winner = (totalScarcity(scar.jobs) < totalScarcity(stable.jobs)) ? scar : stable;
+  const runtimeMs = Math.round(((typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now()) - t0);
+  return { jobs: winner.jobs, moves: winner.moves, statsBefore: obj(usedOfArr(base)), statsAfter: winner.finalObj, runtimeMs };
+};
+// Single application helper used by BOTH finalJobs reconstruction paths (handleGenerate
+// and runReplayFixture). Inert when the flag is OFF → returns the input unchanged, so
+// production output stays byte-identical. No duplicated logic.
+const applyFairnessRebalance = (finalJobs, weekOffset) =>
+  CLEANFLOW_FAIRNESS_PASS_ENABLED ? fairnessRebalancePass(finalJobs, weekOffset).jobs : finalJobs;
+
 const optimizeGlobalSchedule = (selected, allJobs, weekOffset, debugTrace) => {
   if(!selected||!Array.isArray(selected.jobs)||!selected.jobs.length) return selected;
   const constraints=selected.constraints||buildConstraints(weekOffset);
@@ -9572,12 +9721,12 @@ const runReplayFixture = (rawFixture) => {
     const keepBefore = jobsIn.filter(j=>DAYS.indexOf(j.day)<startIdx);
     const keepAfter  = jobsIn.filter(j=>DAYS.indexOf(j.day)>endIdx);
     const lockedJobs = jobsIn.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && j.type==='template' && isFullyAssigned(j); });
-    const actualFinal = [
+    const actualFinal = applyFairnessRebalance([
       ...keepBefore,
       ...lockedJobs.map(j=>({...j,status:isFullyAssigned(j)?'assigned':'needs_review'})),
       ...result.jobs.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && !(j.type==='template' && lockedJobs.some(l=>l.id===j.id)); }),
       ...keepAfter,
-    ];
+    ], input.weekOffset);
     const diff = diffReplayJobs(fx.expectedOutput.jobs, actualFinal);
     return { ok:true, phase:'done', ...diff };
   } catch(e){
@@ -13597,12 +13746,12 @@ function App(){
           message:`Run avviato — ${_traceInput.length} job in ingresso`, data:{ runId:_traceRunId } });
       }
       const result=runAutoSchedule(_traceInput, weekOffset, { debugTrace:_debugTrace });
-      const finalJobs=[
+      const finalJobs=applyFairnessRebalance([
         ...keepBefore,
         ...lockedJobs.map(j=>({...j,status:isFullyAssigned(j)?'assigned':'needs_review'})),
         ...result.jobs.filter(j=>{const i=DAYS.indexOf(j.day);return i>=startIdx&&i<=endIdx&&!(j.type==='template'&&lockedJobs.some(l=>l.id===j.id));}),
         ...keepAfter,
-      ];
+      ], weekOffset);
       // Replay fixture: pair the pre-scheduler input with the scheduled output (deep-
       // copied), kept separate. meta (capturedAt) stays out of the deterministic payload.
       if(CLEANFLOW_DEBUG_CENTER_ENABLED && _replayInput){
