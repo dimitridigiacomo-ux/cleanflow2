@@ -10143,7 +10143,7 @@ function HostawayModal({onImport,onClose,weekOffset=0}){
 }
 
 // ── GENERATE RESULT MODAL ──────────────────────────────────────────────────────
-function GenerateModal({result,constraints,onConfirm,onClose,onGenerate}){
+function GenerateModal({result,constraints,onConfirm,onClose,onGenerate,generating}){
   const [startDay,setStartDay]=useState('Mon');
   const [endDay,  setEndDay  ]=useState('Sun');
   const {jobs,startDay:appliedFrom,endDay:appliedTo}=result||{jobs:[]};
@@ -10207,8 +10207,8 @@ function GenerateModal({result,constraints,onConfirm,onClose,onGenerate}){
 
         <div style={{display:'flex',gap:8}}>
           <button onClick={onClose} style={{flex:1,padding:'12px',borderRadius:10,background:'#F0EDE8',color:C.text,fontWeight:700,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>Annulla</button>
-          <button onClick={()=>onGenerate(startDay,effectiveEnd)} style={{flex:2,padding:'12px',borderRadius:10,background:C.nav,color:'white',fontWeight:800,fontSize:14,border:'none',cursor:'pointer',fontFamily:'inherit',display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
-            <span>⚡</span><span>Genera {rangeLabel}</span>
+          <button onClick={()=>onGenerate(startDay,effectiveEnd)} disabled={generating} style={{flex:2,padding:'12px',borderRadius:10,background:generating?'#9AA0A6':C.nav,color:'white',fontWeight:800,fontSize:14,border:'none',cursor:generating?'not-allowed':'pointer',fontFamily:'inherit',display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
+            <span>{generating?'⏳':'⚡'}</span><span>{generating?'Generazione…':`Genera ${rangeLabel}`}</span>
           </button>
         </div>
       </>
@@ -12614,6 +12614,8 @@ function App(){
   const [selDay,       setSelDay      ]=useState(getTodayKey);
   const [weekOffset,   setWeekOffset  ]=useState(1); // default: prossima settimana (planning)
   const [modal,        setModal       ]=useState(null);
+  const [isGenerating, setIsGenerating]=useState(false);
+  const isGeneratingRef=useRef(false);
   const [editJob,      setEditJob     ]=useState(null);
   const [quickCleanerId,setQuickCleanerId]=useState(null);
   const [highlightJob, setHighlightJob]=useState(null);
@@ -13536,7 +13538,7 @@ function App(){
   };
 
   // ── AUTO-SCHEDULE ──
-  const handleGenerate=(startDay, endDay)=>{
+  const handleGenerate=async (startDay, endDay)=>{
     if(planningWeekOffset!==null && planningWeekOffset!==weekOffset){
       showToast('Settimana non allineata — torna alla settimana caricata o sostituisci con questa settimana','error');
       return;
@@ -13546,6 +13548,12 @@ function App(){
     if(!wf.hostawayLoaded){showToast('Importa prima Hostaway API (o CSV come fallback)','warn');return;}
     if(jobs.length===0){showToast('Carica prima il template o importa da Hostaway','warn');return;}
     if(!startDay){ setGenerateResult(null); setModal('generateResult'); return; }
+    // UX: block re-entry with a synchronous ref (state is async), show the overlay, and
+    // let React paint it (two rAFs) BEFORE the synchronous scheduler runs below.
+    if(isGeneratingRef.current) return;
+    isGeneratingRef.current=true;
+    setIsGenerating(true);
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
     // A new generation attempt supersedes any previous replay fixture: clear it up
     // front so a run that then FAILS cannot leave a stale fixture downloadable. Placed
     // after the !startDay guard, so merely opening (or cancelling) the range modal —
@@ -13655,6 +13663,9 @@ function App(){
         }
       }catch(_){ /* the trace must never mask the operational error */ }
       showToast('Errore nella generazione: '+e.message,'error');
+    }finally{
+      isGeneratingRef.current=false;
+      setIsGenerating(false);
     }
   };
 
@@ -14339,7 +14350,14 @@ function App(){
       </Modal>}
 
       {modal==='hostaway'&&<Modal onClose={()=>setModal(null)}><HostawayModal onImport={doImportHostaway} onClose={()=>setModal(null)} weekOffset={weekOffset}/></Modal>}
-      {modal==='generateResult'&&<Modal onClose={()=>{setModal(null);setGenerateResult(null);}}><GenerateModal result={generateResult} constraints={generateResult?.constraints} onConfirm={applyGenerate} onClose={()=>{setModal(null);setGenerateResult(null);}} onGenerate={(startDay,endDay)=>handleGenerate(startDay,endDay)}/></Modal>}
+      {modal==='generateResult'&&<Modal onClose={()=>{setModal(null);setGenerateResult(null);}}><GenerateModal result={generateResult} constraints={generateResult?.constraints} onConfirm={applyGenerate} onClose={()=>{setModal(null);setGenerateResult(null);}} onGenerate={(startDay,endDay)=>handleGenerate(startDay,endDay)} generating={isGenerating}/></Modal>}
+      {isGenerating&&(
+        <div style={{position:'fixed',inset:0,zIndex:500,background:'rgba(0,0,0,0.45)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12,color:'#fff'}}>
+          <div style={{fontSize:34,animation:'spin 1.2s linear infinite'}}>⟳</div>
+          <div style={{fontWeight:800,fontFamily:"'Syne',sans-serif"}}>Generazione turni in corso…</div>
+          <style>{`@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}`}</style>
+        </div>
+      )}
       {modal==='add'&&<Modal onClose={()=>setModal(null)}><JobForm initial={{propertyId:'',day:selDay,startTime:'09:00',cleanerIds:[],note:'',type:'extra',manualEndTime:'',cleanerTimeOverrides:{}}} onSave={saveJob}/></Modal>}
       {modal==='edit'&&editJob&&<Modal onClose={()=>setModal(null)}><JobForm initial={{propertyId:editJob.propertyId,day:editJob.day,startTime:editJob.startTime,cleanerIds:[...editJob.cleanerIds],note:editJob.note||'',type:editJob.type||'extra',manualEndTime:editJob.manualEndTime||'',cleanerTimeOverrides:editJob.cleanerTimeOverrides?{...editJob.cleanerTimeOverrides}:{}}} onSave={saveJob} onDelete={deleteJob}/></Modal>}
       {/* ── LAST MINUTE MODAL ─── */}
