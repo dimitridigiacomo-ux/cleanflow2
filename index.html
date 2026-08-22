@@ -5544,8 +5544,8 @@ const buildCombinations = (pool, size, maxResults) => {
 // scan, far cheaper. Two-strategy safeguard: a stable-only run and a scarcity-aware run
 // (real getMaleScarcityPenalty/getSeniorScarcityPenalty as an exact-fairness-parity
 // tie-break), then keep the lexicographically fairest result, breaking ties by lower
-// scarcity penalty then a stable choice. Off by default → production output byte-identical.
-const CLEANFLOW_FAIRNESS_PASS_ENABLED = false;
+// scarcity penalty then a stable choice. When disabled, output stays byte-identical.
+const CLEANFLOW_FAIRNESS_PASS_ENABLED = true;
 const FAIRNESS_MOVE_CAP = 8;
 const fairnessRebalancePass = (finalJobs, weekOffset, opts={}) => {
   const t0 = (typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now();
