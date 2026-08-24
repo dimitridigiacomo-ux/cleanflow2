@@ -9720,7 +9720,7 @@ const runReplayFixture = (rawFixture) => {
     const jobsIn = input.jobs;
     const keepBefore = jobsIn.filter(j=>DAYS.indexOf(j.day)<startIdx);
     const keepAfter  = jobsIn.filter(j=>DAYS.indexOf(j.day)>endIdx);
-    const lockedJobs = jobsIn.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && j.type==='template' && isFullyAssigned(j); });
+    const lockedJobs = jobsIn.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && isLockedTemplateJob(j); });
     const actualFinal = applyFairnessRebalance([
       ...keepBefore,
       ...lockedJobs.map(j=>({...j,status:isFullyAssigned(j)?'assigned':'needs_review'})),
@@ -13717,8 +13717,8 @@ function App(){
       const keepBefore=jobs.filter(j=>DAYS.indexOf(j.day)<startIdx);
       const keepAfter =jobs.filter(j=>DAYS.indexOf(j.day)>endIdx);
       const regenJobs =jobs.filter(j=>{const i=DAYS.indexOf(j.day);return i>=startIdx&&i<=endIdx;});
-      const lockedJobs=regenJobs.filter(j=>j.type==='template'&&isFullyAssigned(j));
-      const jobsToRegen=regenJobs.filter(j=>!(j.type==='template'&&isFullyAssigned(j)));
+      const lockedJobs=regenJobs.filter(j=>isLockedTemplateJob(j));
+      const jobsToRegen=regenJobs.filter(j=>!isLockedTemplateJob(j));
       const prepared=jobsToRegen.map(j=>{
         const assignedCount=(j.cleanerIds||[]).length;
         const required=getJobRequiredCleaners(j);
