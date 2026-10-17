@@ -2670,6 +2670,8 @@ const canSeeDebug = () => CLEANFLOW_DEBUG_CENTER_ENABLED && ((getSession() || {}
 // Set by App: called when the server rejects the session (expired, revoked, user
 // disabled) so the login shows again without discarding in-memory work.
 let __cfOnAuthLost = null;
+// Set by App: called when the server requires the provisional password to be changed.
+let __cfOnMustChange = null;
 const CF_AUTH_LOST_CODES = ['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_INVALID_SESSION'];
 
 // Single entry point for every backend call. Never throws: failures come back as
@@ -2696,6 +2698,7 @@ const cfApi = async (action, payload={}, { timeoutMs=60000 }={}) => {
         if(__cfOnAuthLost) __cfOnAuthLost(data.error);
       }
     }
+    if(data && data.code==='PASSWORD_CHANGE_REQUIRED' && __cfOnMustChange) __cfOnMustChange();
     return data || { ok:false, error:'Risposta vuota dal server' };
   } catch(e) {
     if(e.name==='AbortError') return { ok:false, timeout:true, error:'Timeout: il server non ha risposto' };
@@ -9837,6 +9840,45 @@ function Toast({toast}){
   );
 }
 
+// Change-password form: used for the forced first-login change (dark card) and from
+// the "Password" button (inside Modal). The server checks the current password.
+function ChangePasswordForm({ dark=false, knownCurrent='', onDone, onCancel, cancelLabel='Annulla' }){
+  const [cur,setCur]=useState('');
+  const [nw,setNw]=useState('');
+  const [nw2,setNw2]=useState('');
+  const [err,setErr]=useState('');
+  const [busy,setBusy]=useState(false);
+  const submit=async()=>{
+    if(busy) return;
+    const current=knownCurrent||cur;
+    if(!current){ setErr('Inserisci la password attuale'); return; }
+    if(nw.length<10){ setErr('La nuova password deve avere almeno 10 caratteri'); return; }
+    if(nw!==nw2){ setErr('Le due password nuove non coincidono'); return; }
+    setBusy(true); setErr('');
+    const r=await cfApi('cfChangePassword',{ currentPassword:current, newPassword:nw });
+    setBusy(false);
+    if(!r||r.ok!==true){ setErr((r&&r.error)||'Cambio password non riuscito'); return; }
+    const sess=getSession(); if(sess) saveSession({ ...sess, user:{ ...sess.user, ...(r.user||{}) } });
+    setCur(''); setNw(''); setNw2('');
+    if(onDone) onDone();
+  };
+  const field={width:'100%',padding:'12px 14px',borderRadius:12,fontSize:15,fontFamily:'inherit',marginBottom:10,outline:'none',
+    border:dark?'1.5px solid rgba(255,255,255,0.18)':'1.5px solid #DDD',background:dark?'#141414':'white',color:dark?'#F7F3EC':'#1A1A1A'};
+  const onKey=e=>{ if(e.key==='Enter') submit(); };
+  return(
+    <div style={{textAlign:'left'}}>
+      {!dark&&<div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,marginBottom:6}}>Cambia password</div>}
+      {!dark&&<div style={{fontSize:13,color:'#666',marginBottom:16,lineHeight:1.5}}>Almeno 10 caratteri. Gli altri dispositivi collegati con il tuo utente verranno disconnessi.</div>}
+      {!knownCurrent&&<input type="password" placeholder="Password attuale" autoComplete="current-password" value={cur} onChange={e=>{setCur(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>}
+      <input type="password" placeholder="Nuova password" autoComplete="new-password" value={nw} onChange={e=>{setNw(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>
+      <input type="password" placeholder="Ripeti la nuova password" autoComplete="new-password" value={nw2} onChange={e=>{setNw2(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>
+      {err&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>{err}</div>}
+      <button onClick={submit} disabled={busy} style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:busy?'wait':'pointer',opacity:busy?0.7:1,fontFamily:'inherit'}}>{busy?'Salvataggio…':'Salva nuova password'}</button>
+      {onCancel&&<button onClick={onCancel} disabled={busy} style={{width:'100%',padding:'10px',marginTop:8,borderRadius:12,background:'transparent',color:dark?'rgba(255,255,255,0.55)':'#666',fontWeight:700,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>{cancelLabel}</button>}
+    </div>
+  );
+}
+
 function Modal({children,onClose}){
   return(
     <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:300,display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
@@ -11879,6 +11921,7 @@ function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conf
         </button>
         <div style={{display:'flex',alignItems:'center',gap:6,fontSize:11,color:'#9FB6CC',marginTop:2}}>
           <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>👤 Supervisor: {supervisorName||'non impostato'}</span>
+          <button onClick={()=>setModal('changePassword')} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Password</button>
           <button onClick={onChangeSupervisorName} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Esci</button>
         </div>
       </div>
@@ -12868,6 +12911,9 @@ function App(){
   const [loggingIn,    setLoggingIn   ]=useState(false);
   const [authLost,     setAuthLost    ]=useState(null); // set when the server rejects the session mid-use
   const [authEpoch,    setAuthEpoch   ]=useState(0);    // bumped on every login: refetches the published week
+  // Provisional (owner-set) password: must be replaced before using the app.
+  const [mustChangePw, setMustChangePw]=useState(()=>!!(((getSession()||{}).user||{}).mustChangePassword));
+  const provisionalPwRef=useRef(''); // the password just typed at login, in memory only
   const [sheetStatus,  setSheetStatus ]=useState('loading'); // 'loading'|'ok'|'warn'|'error'
   const [sheetLoading, setSheetLoading]=useState(false);
   const dataReady = sheetStatus==='ok';
@@ -12922,6 +12968,9 @@ function App(){
     setLoggingIn(false);
     if(!r || r.ok!==true || !r.token){ setPwError((r&&r.error)||'Accesso non riuscito'); return; }
     saveSession({ token:r.token, user:r.user, expiresAt:r.expiresAt });
+    const mustChange = !!(r.user && r.user.mustChangePassword);
+    provisionalPwRef.current = mustChange ? password : '';
+    setMustChangePw(mustChange);
     setSupervisorName(r.user.displayName);
     setSupervisorNameUI(r.user.displayName);
     setPwInput('');
@@ -12939,7 +12988,8 @@ function App(){
   // week in progress) is kept, because `authed` does not change.
   useEffect(()=>{
     __cfOnAuthLost = (msg) => setAuthLost(msg || 'Sessione scaduta: accedi di nuovo.');
-    return ()=>{ __cfOnAuthLost = null; };
+    __cfOnMustChange = () => setMustChangePw(true);
+    return ()=>{ __cfOnAuthLost = null; __cfOnMustChange = null; };
   },[]);
   // Initial-load guard: don't autosave during the first published+draft decision
   const initialLoadDoneRef = useRef(false);
@@ -14335,6 +14385,20 @@ function App(){
   );
 
 
+  // Provisional password (set by the owner): the user picks their own before the app opens.
+  if(mustChangePw) return(
+    <div style={{minHeight:'100vh',background:'#F5F2EE',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Nunito',sans-serif"}}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
+      <div style={{background:'#0A0A0A',borderRadius:24,padding:'40px 32px',width:'100%',maxWidth:400,boxShadow:'0 18px 50px rgba(0,0,0,0.22)',border:'1px solid rgba(255,255,255,0.10)',textAlign:'center'}}>
+        <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:'#F7F3EC',marginBottom:8}}>Imposta la tua password</div>
+        <div style={{fontSize:13,color:'rgba(255,255,255,0.6)',lineHeight:1.5,marginBottom:22}}>Stai usando una password provvisoria. Scegline una tua (almeno 10 caratteri): da ora la conoscerai solo tu.</div>
+        <ChangePasswordForm dark knownCurrent={provisionalPwRef.current}
+          onDone={()=>{ provisionalPwRef.current=''; setMustChangePw(false); setAuthEpoch(e=>e+1); showToast('Password impostata','ok'); }}
+          onCancel={doLogout} cancelLabel="Esci"/>
+      </div>
+    </div>
+  );
+
   const dataEssentialsMissing = PROPERTIES.length===0 || CLEANERS.length===0;
 
   const mainContent=(
@@ -14508,6 +14572,7 @@ function App(){
             </div>
             <div style={{display:'flex',alignItems:'center',gap:8,marginTop:8,fontSize:11,color:'#9FB6CC'}}>
               <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>👤 Supervisor: {supervisorNameUI||'non impostato'}</span>
+              <button onClick={()=>setModal('changePassword')} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Password</button>
               <button onClick={doLogout} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Esci</button>
             </div>
           </div>
@@ -14641,6 +14706,7 @@ function App(){
 
       {modal==='hostaway'&&<Modal onClose={()=>setModal(null)}><HostawayModal onImport={doImportHostaway} onClose={()=>setModal(null)} weekOffset={weekOffset}/></Modal>}
       {modal==='generateResult'&&<Modal onClose={()=>{setModal(null);setGenerateResult(null);}}><GenerateModal result={generateResult} constraints={generateResult?.constraints} onConfirm={applyGenerate} onClose={()=>{setModal(null);setGenerateResult(null);}} onGenerate={(startDay,endDay)=>handleGenerate(startDay,endDay)} generating={isGenerating}/></Modal>}
+      {modal==='changePassword'&&<Modal onClose={()=>setModal(null)}><ChangePasswordForm onDone={()=>{setModal(null);showToast('Password cambiata. Gli altri dispositivi collegati sono stati disconnessi.','ok');}} onCancel={()=>setModal(null)}/></Modal>}
       {isGenerating&&(
         <div style={{position:'fixed',inset:0,zIndex:500,background:'rgba(0,0,0,0.45)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12,color:'#fff'}}>
           <div style={{fontSize:34,animation:'spin 1.2s linear infinite'}}>⟳</div>
