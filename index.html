@@ -971,23 +971,33 @@ const buildLocalAssignmentOptions = (targetJob, jobs, weekOffset) => {
     const newWeekly = (weeklyHrs[cl.id]||0)+dur;
     const overDaily = dailyLim && newDaily>dailyLim ? 1 : 0;
     const overWeekly = weeklyLim && newWeekly>weeklyLim ? 1 : 0;
-    const projDays = new Set(Object.entries(dailyHrs[cl.id]||{}).filter(([,h])=>h>0).map(([d])=>d));
-    projDays.add(safeTargetJob.day);
-    // Use the canonical max-worked-days threshold; remains a soft manual-solver warning.
+    const currentDays = new Set(Object.entries(dailyHrs[cl.id]||{}).filter(([,h])=>h>0).map(([d])=>d));
+    // A cleaner already on the target job already works that day in the real plan (dailyHrs
+    // excludes the target job), so keeping her there never opens a new working day.
+    if(existingTargetIds.has(cl.id)) currentDays.add(safeTargetJob.day);
+    const projDays = new Set(currentDays); projDays.add(safeTargetJob.day);
+    // Max-worked-days is HARD for NEW or WORSENED overruns (never for a pre-existing overrun): reject
+    // only when the target opens a NEW working day AND that pushes the cleaner over her effective cap.
     const clMaxDays = getEffectiveMaxWorkedDays(cl);
-    const overWorkDays = clMaxDays && projDays.size>clMaxDays ? 1 : 0;
+    const alreadyOverDays = clMaxDays && projDays.size>clMaxDays ? 1 : 0;                 // diagnosi: il piano finale supera già il limite
+    const overWorkDays = alreadyOverDays && projDays.size>currentDays.size ? 1 : 0;       // blocco: la mossa introduce o peggiora il superamento
     const isSenior = cl.type==='senior' ? 0.1 : 0; // soft penalty for using senior on simple jobs
     const score = overDaily*10 + overWeekly*8 + overWorkDays*5 + newDaily + (newWeekly/10) + isSenior;
 
     const reasonParts = [];
-    if(!overDaily&&!overWeekly&&!overWorkDays) reasonParts.push('nessun superamento limiti');
+    if(!overDaily&&!overWeekly&&!alreadyOverDays) reasonParts.push('nessun superamento limiti');
     else {
       if(overDaily) reasonParts.push(`supererebbe limite giornaliero (${newDaily}h/${dailyLim}h)`);
       if(overWeekly) reasonParts.push(`supererebbe limite settimanale (${newWeekly}h/${weeklyLim}h)`);
       if(overWorkDays) reasonParts.push(`supererebbe giorni lavorativi (${projDays.size}/${clMaxDays})`);
+      else if(alreadyOverDays) reasonParts.push(`Superamento già presente: ${projDays.size}/${clMaxDays} giorni; questa assegnazione non aumenta i giorni lavorati`);
     }
     reasonParts.push(`${(dailyHrs[cl.id]?.[safeTargetJob.day]||0).toFixed(1)}h già oggi, ${(weeklyHrs[cl.id]||0).toFixed(1)}h settimana`);
 
+    if(overWorkDays){ // HARD: an assisted solution must never recommend a new max-worked-days overrun
+      rejectedCandidates.push({cleanerId:cl.id, cleanerName:cl.name, reason:`supererebbe giorni lavorativi (${projDays.size}/${clMaxDays})`});
+      return;
+    }
     validCandidates.push({
       cleanerId:cl.id, cleanerName:cl.name, score, isSenior:cl.type==='senior',
       reason:reasonParts.join(' · '),
@@ -1170,6 +1180,7 @@ const buildLocalAssignmentOptions = (targetJob, jobs, weekOffset) => {
         ? `Servono ${needed} cleaners, disponibili solo ${validCandidates.length} senza conflitti per ${getJobDisplayName(targetJob)} ${targetJob.startTime}–${m2t(jE)} ${DAY_IT[targetJob.day]}`
         : `Nessuna cleaner disponibile per ${getJobDisplayName(targetJob)} ${targetJob.startTime}–${m2t(jE)} ${DAY_IT[targetJob.day]}`;
     }
+    if(!validCandidates.length && rejectedCandidates.some(r=>/giorni lavorativi/.test(r.reason||''))) reason = 'Nessuna soluzione valida senza superare i limiti (giorni lavorativi massimi). Solo escalation manuale.';
     escalation = {
       reason,
       options:['Spostare orario','Chiamare cleaner extra','Riassegnare manualmente un job esistente'],
@@ -3160,6 +3171,10 @@ const getTodayKey = () => ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date()
 // date flows through getWeekDates → getMondayOf. Never read/written by scheduler/optimizer/
 // repair/scoring, never persisted, never sent to backend. Set ONLY by the replay harness.
 let __CF_REPLAY_NOW = null;
+// Partial-regen boundary: when set (Set of day names), the scheduler/optimizer/repair/
+// fairness may READ the whole week but may only RESET/REASSIGN/donor/modify jobs whose
+// day is in this Set. Set at runAutoSchedule entry, restored on exit. null = whole week.
+let __CF_RUN_MODIFIABLE_DAYS = null;
 const getMondayOf = (offset=0) => { const now=__CF_REPLAY_NOW?new Date(__CF_REPLAY_NOW.getTime()):new Date(); const dow=now.getDay(); const m=new Date(now); m.setDate(now.getDate()-(dow===0?6:dow-1)+offset*7); m.setHours(0,0,0,0); return m; };
 const getWeekDates = (offset=0) => { const m=getMondayOf(offset); return DAYS.map((_,i)=>{ const d=new Date(m); d.setDate(m.getDate()+i); return d; }); };
 // Local-timezone-safe YYYY-MM-DD (avoid UTC shift on dates near midnight in Malta/Europe)
@@ -3439,6 +3454,7 @@ const isSchedulerOwnedAssignment = job => {
 };
 const resetSchedulerOwnedAssignments = jobs => (jobs || []).map(job => {
   if(!isSchedulerOwnedAssignment(job)) return job;
+  if(__CF_RUN_MODIFIABLE_DAYS && job.day && !__CF_RUN_MODIFIABLE_DAYS.has(job.day)) return job; // out-of-range: keep as fixed context
   return {
     ...job,
     cleanerIds: [],
@@ -4134,6 +4150,7 @@ const compareDemandAwareMutableJobs = (a, b, jobMeta) => {
 };
 
 const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
+  const __savedMod = __CF_RUN_MODIFIABLE_DAYS; __CF_RUN_MODIFIABLE_DAYS = _opts.modifiableDays || null; try {
   // ── FASE 2 TRACE (read-only) ──────────────────────────────────────────────
   // The collector is created ONCE at the Rigenera call site and threaded in through
   // _opts. runAutoSchedule recurses (see the coverage safety gate at the bottom) to
@@ -4220,7 +4237,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
   // this same job is processed further down in the loop, commitTeam() commits ONLY
   // the newly-picked cleaners — see templatePreCommitted near commitTeam's call site.
   baseJobs
-    .filter(j => (j.cleanerIds||[]).length>0 && (!needsWork(j) || isAuthoritativeFixedTemplate(j)))
+    .filter(j => (j.cleanerIds||[]).length>0 && (!needsWork(j) || isAuthoritativeFixedTemplate(j) || (__CF_RUN_MODIFIABLE_DAYS && j.day && !__CF_RUN_MODIFIABLE_DAYS.has(j.day))))
     .forEach(job=>{
     job.cleanerIds.forEach(cId=>{
       const effDur=getCleanerEffectiveJobDuration(job,cId);
@@ -4515,7 +4532,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
 
   // Schedule jobs that need work. For flexible jobs we try candidate start times across
   // the window (30-min steps) and choose the first slot that yields a valid full team.
-  const unassigned=[...baseJobs.filter(needsWork)];
+  const unassigned=[...baseJobs.filter(j=>needsWork(j)&&(!__CF_RUN_MODIFIABLE_DAYS||!j.day||__CF_RUN_MODIFIABLE_DAYS.has(j.day)))];
   // Initialized here so it is in scope during difficulty pre-computation
   // (buildEligibleForSlot reads it via the fairness criticality signal).
   const processedJobIds = new Set();
@@ -5156,7 +5173,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
     jobs: [
       // Untouched jobs = everything NOT in the needsWork set (locked template jobs, and
       // jobs already complete on count + gender). Keep their team; set status by validity.
-      ...baseJobs.filter(j=>!needsWork(j)).map(j=>({
+      ...baseJobs.filter(j=>!needsWork(j) || (__CF_RUN_MODIFIABLE_DAYS && j.day && !__CF_RUN_MODIFIABLE_DAYS.has(j.day))).map(j=>({
         ...j,
         status: 'assigned',
       })),
@@ -5178,6 +5195,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
       demandAwareEnabled: false,
       debugTrace: _opts.debugTrace,
       debugPlan: 'baseline',
+      modifiableDays: _opts.modifiableDays,
     });
     if(trace) trace.setPlan('demand_aware');
     const winner = chooseSaferSchedulePlan(baseline, schedulerResult);
@@ -5205,6 +5223,7 @@ const runAutoSchedule = (allJobs, weekOffset=0, _opts={}) => {
   }
   schedulerResult.hardValidation = validateFinalScheduleHardConstraints(schedulerResult.jobs, schedulerResult.constraints);
   return schedulerResult;
+  } finally { __CF_RUN_MODIFIABLE_DAYS = __savedMod; }
 };
 
 // ── GLOBAL SUPERVISOR OPTIMIZER (Fix 10L-B) ──────────────────────────────────
@@ -5216,11 +5235,25 @@ const OPT_MAX_MOVES  = 25;
 
 const isMutableSchedulerJob = job => {
   if(!job) return false;
+  if(__CF_RUN_MODIFIABLE_DAYS && job.day && !__CF_RUN_MODIFIABLE_DAYS.has(job.day)) return false; // out-of-range boundary
   if(isLockedTemplateJob(job)) return false;
   if(job.manualEdited === true || job.schedulerDecisionCode === 'manual_edit') return false;
   if(job.rescueUsed === true   || job.schedulerDecisionCode === 'rescue_split') return false;
   return true;
 };
+
+// SHARED final-state max-worked-days barrier. Distinct worked-days per cleaner over the whole
+// plan; a cleaner is a NEW/WORSENED offender when candidate days exceed the cap AND exceed the
+// baseline. Pre-existing overruns (e.g. from locked Templates) are never flagged unless worsened.
+const workedDaysByCleanerFinal = jobs => { const m={}; (jobs||[]).forEach(j=>{ if(!DAYS.includes(j.day)) return; dedupeCleanerIds(j.cleanerIds||[]).forEach(id=>{(m[id]=m[id]||new Set()).add(j.day);}); }); return m; };
+const newMaxDaysOffenders = (baselineJobs, candidateJobs) => {
+  const b=workedDaysByCleanerFinal(baselineJobs), c=workedDaysByCleanerFinal(candidateJobs); const out=[];
+  CLEANERS.forEach(cl=>{ const cd=(c[cl.id]||new Set()).size, bd=(b[cl.id]||new Set()).size, mx=getEffectiveMaxWorkedDays(cl); if(cd>mx && cd>bd) out.push(cl.id); });
+  return out;
+};
+// Final barrier: if newMaxDaysOffenders(baseline, candidate) is non-empty the candidate introduces
+// or worsens a max-worked-days overrun and MUST be BLOCKED — handleGenerate refuses to present it as
+// a result (current shifts preserved) and runReplayFixture returns a max_worked_days phase error.
 
 // Build per-cleaner maps from a complete job list for optimizer validation.
 const buildOptimizerMaps = (jobs, constraints) => {
@@ -5551,6 +5584,7 @@ const fairnessRebalancePass = (finalJobs, weekOffset, opts={}) => {
   const t0 = (typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now();
   const constraints = opts.constraints || buildConstraints(weekOffset);
   const moveCap = opts.moveCap!=null ? opts.moveCap : FAIRNESS_MOVE_CAP;
+  const modifiableDays = opts.modifiableDays || null;
   const capOf = c => Math.max(1,(constraints[c.id]?.maxWeeklyHrs||0)>0?constraints[c.id].maxWeeklyHrs:(Number(c.weeklyHrs)||40));
   const tgt={}, days5={}, daysSet={}, trainSet={};
   CLEANERS.forEach(c=>{const cp=capOf(c);tgt[c.id]=Math.min(30,cp*0.75);days5[c.id]=(c.days||[]).length>=5;daysSet[c.id]=new Set(c.days||[]);trainSet[c.id]=new Set((TRAINING[c.id]||[]).map(String));});
@@ -5597,7 +5631,7 @@ const fairnessRebalancePass = (finalJobs, weekOffset, opts={}) => {
     for(let mv=0; mv<moveCap; mv++){
       const used=usedOfArr(jobs); const curObj=obj(used);
       const under=id=>(used[id]||0)<tgt[id], over=id=>(used[id]||0)>tgt[id];
-      const mutIdx=[]; for(let i=0;i<N;i++) if(meta[i].mut) mutIdx.push(i);
+      const mutIdx=[]; for(let i=0;i<N;i++) if(meta[i].mut && (!modifiableDays || modifiableDays.has(meta[i].day))) mutIdx.push(i);
       const cands=[];
       for(const Ji of mutIdx){ const C=meta[Ji]; const ids=idsOf(jobs[Ji]);
         for(const X of ids){ if(!over(X))continue;
@@ -5670,8 +5704,8 @@ const fairnessRebalancePass = (finalJobs, weekOffset, opts={}) => {
 // Single application helper used by BOTH finalJobs reconstruction paths (handleGenerate
 // and runReplayFixture). Inert when the flag is OFF → returns the input unchanged, so
 // production output stays byte-identical. No duplicated logic.
-const applyFairnessRebalance = (finalJobs, weekOffset) =>
-  CLEANFLOW_FAIRNESS_PASS_ENABLED ? fairnessRebalancePass(finalJobs, weekOffset).jobs : finalJobs;
+const applyFairnessRebalance = (finalJobs, weekOffset, modifiableDays) =>
+  CLEANFLOW_FAIRNESS_PASS_ENABLED ? fairnessRebalancePass(finalJobs, weekOffset, { modifiableDays }).jobs : finalJobs;
 
 const optimizeGlobalSchedule = (selected, allJobs, weekOffset, debugTrace) => {
   if(!selected||!Array.isArray(selected.jobs)||!selected.jobs.length) return selected;
@@ -9711,7 +9745,7 @@ const runReplayFixture = (rawFixture) => {
     for(const k of Object.keys(OP_SETTINGS)) delete OP_SETTINGS[k];
     Object.assign(OP_SETTINGS, input.opSettings || {});
     // Run the REAL scheduler (empty opts: production path minus diagnostics/trace).
-    const result = runAutoSchedule(input.jobs, input.weekOffset, {});
+    const result = runAutoSchedule(input.jobs, input.weekOffset, { modifiableDays:new Set(DAYS.slice(DAYS.indexOf(input.startDay), (input.endDay?DAYS.indexOf(input.endDay):6)+1)) });
     // Rebuild finalJobs EXACTLY as handleGenerate does: same startDay/endDay slicing,
     // keepBefore/keepAfter passthrough, locked-template preservation.
     const isFullyAssigned = job => (job.cleanerIds||[]).length >= getJobRequiredCleaners(job);
@@ -9721,12 +9755,19 @@ const runReplayFixture = (rawFixture) => {
     const keepBefore = jobsIn.filter(j=>DAYS.indexOf(j.day)<startIdx);
     const keepAfter  = jobsIn.filter(j=>DAYS.indexOf(j.day)>endIdx);
     const lockedJobs = jobsIn.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && isLockedTemplateJob(j); });
-    const actualFinal = applyFairnessRebalance([
+    let actualFinal = applyFairnessRebalance([
       ...keepBefore,
       ...lockedJobs.map(j=>({...j,status:isFullyAssigned(j)?'assigned':'needs_review'})),
       ...result.jobs.filter(j=>{ const i=DAYS.indexOf(j.day); return i>=startIdx && i<=endIdx && !(j.type==='template' && lockedJobs.some(l=>l.id===j.id)); }),
       ...keepAfter,
-    ], input.weekOffset);
+    ], input.weekOffset, new Set(DAYS.slice(startIdx, endIdx+1)));
+    const __mdOffenders = newMaxDaysOffenders(input.jobs, actualFinal);
+    if(__mdOffenders.length){
+      // Same candidate that BLOCKS generation in the app: replay must surface an explicit
+      // max-worked-days phase error, never a (fake) successful diff. Tests the ACTUAL path —
+      // reconstruction + barrier — not a second call of a shared helper.
+      return { ok:false, phase:'max_worked_days', error:`generazione bloccata: ${__mdOffenders.length} cleaner in nuovo/peggiorato superamento giorni lavorativi`, offenderCount:__mdOffenders.length };
+    }
     const diff = diffReplayJobs(fx.expectedOutput.jobs, actualFinal);
     return { ok:true, phase:'done', ...diff };
   } catch(e){
@@ -13437,6 +13478,11 @@ function App(){
     const cleanIds = dedupeCleanerIds(action.cleanerIds);
     const currentJob = jobs.find(j=>j.id===action.jobId);
     const currentIds = dedupeCleanerIds(currentJob?.cleanerIds);
+    const __candAction = jobs.map(j=>j.id===action.jobId?{...j,cleanerIds:cleanIds}:j);
+    if(newMaxDaysOffenders(jobs, __candAction).length){
+      showToast('Azione bloccata: supererebbe i giorni lavorativi massimi di una cleaner','error');
+      return;
+    }
     const isNoOp = currentIds.length===cleanIds.length
       && [...currentIds].sort().join(',')===[...cleanIds].sort().join(',');
     if(isNoOp){
@@ -13745,13 +13791,29 @@ function App(){
         _debugTrace.push({ phase:'run', type:'run_started',
           message:`Run avviato — ${_traceInput.length} job in ingresso`, data:{ runId:_traceRunId } });
       }
-      const result=runAutoSchedule(_traceInput, weekOffset, { debugTrace:_debugTrace });
-      const finalJobs=applyFairnessRebalance([
+      const result=runAutoSchedule(_traceInput, weekOffset, { debugTrace:_debugTrace, modifiableDays:new Set(DAYS.slice(startIdx, endIdx+1)) });
+      let finalJobs=applyFairnessRebalance([
         ...keepBefore,
         ...lockedJobs.map(j=>({...j,status:isFullyAssigned(j)?'assigned':'needs_review'})),
         ...result.jobs.filter(j=>{const i=DAYS.indexOf(j.day);return i>=startIdx&&i<=endIdx&&!(j.type==='template'&&lockedJobs.some(l=>l.id===j.id));}),
         ...keepAfter,
-      ], weekOffset);
+      ], weekOffset, new Set(DAYS.slice(startIdx, endIdx+1)));
+      { const __mdOffenders = newMaxDaysOffenders(jobs, finalJobs);
+        if(__mdOffenders.length){
+          // BLOCK: the reconstruction introduces/worsens a max-worked-days overrun. Do NOT present it
+          // as a generated result — no applicable plan, no success fixture, no 'completed' trace. The
+          // current shifts are preserved (setJobs is never called here; the live plan is untouched).
+          if(_debugTrace && _debugTrace.enabled){
+            _debugTrace.addError('max_worked_days_blocked', `Generazione bloccata: ${__mdOffenders.length} cleaner supererebbero i giorni lavorativi massimi`, null);
+            _debugTrace.push({ phase:'run', type:'max_worked_days_barrier', message:`Barriera max-worked-days: generazione BLOCCATA — ${__mdOffenders.length} cleaner in nuovo/peggiorato superamento`, data:{ cleanerIds:__mdOffenders } });
+            setLastDebugTrace(_debugTrace.finalize({ status:'blocked', weekStartISO:getWeekStartISO(weekOffset), weekEndISO:getWeekEndISO(weekOffset) }));
+          }
+          setLastReplayFixture(null);   // never leave a success fixture from a blocked run
+          setGenerateResult(null);      // azzera eventuali risultati applicabili rimasti
+          showToast('Generazione bloccata: una o più cleaner supererebbero i giorni lavorativi massimi. Turni precedenti conservati.','error');
+          return;                        // il finally chiude l'overlay di caricamento
+        }
+      }
       // Replay fixture: pair the pre-scheduler input with the scheduled output (deep-
       // copied), kept separate. meta (capturedAt) stays out of the deterministic payload.
       if(CLEANFLOW_DEBUG_CENTER_ENABLED && _replayInput){
