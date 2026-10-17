@@ -1,0 +1,5 @@
+# Impostazioni locali di Claude Code (permessi personali): mai nel repo pubblico
+.claude/settings.local.json
+.claude/launch.json
+# Output temporanei
+*.out
