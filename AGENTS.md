@@ -4,8 +4,8 @@ CleanFlow pianifica i turni di pulizia di un portafoglio di affitti brevi a Malt
 
 - **Frontend**: un'unica SPA React in `index.html`. JSX tradotto nel browser da Babel standalone, nessun build step.
 - **Backend**: Google Apps Script. Pubblica/ripristina le settimane e fa da proxy verso Hostaway.
-  - **Non è su GitHub.** Una copia (`Code.gs`, `BO_Backend.gs`, `appsscript.json`) sta nel branch **locale** `main`, che ha una storia separata da `origin/main`: si legge con `git show main:Code.gs`.
-  - Risale ad agosto 2026: prima di basarsi su di essa, va confrontata con il codice attualmente deployato nell'editor Apps Script.
+  - **Non sta in questo repo pubblico, e non deve mai finirci** (contiene lo Spreadsheet ID). Vive in un **repo privato separato**, `CleanFlow-backend` (cartella accanto a questa), il cui primo commit è il codice in produzione al 2026-10-17.
+  - Il branch locale `main` di questo repo ne contiene una copia di agosto, identica a quella in produzione a ottobre, ma è storico: si lavora sul repo privato.
 - **Dati**: Google Sheets, letti come CSV pubblicati (`SHEET_URLS` in `index.html`).
 - **Deploy**: GitHub Pages a ogni push su `main`.
 - **Attenzione**: c'è `.nojekyll`, quindi **tutto ciò che è committato è pubblico** all'URL del sito, file nascosti compresi.
@@ -56,7 +56,7 @@ Devono finire con `ALL PASS`. Il controllo (1) "identico a origin/main" fallisce
   - non produce artefatti di successo (fixture, trace `completed`, risultato applicabile);
   - chiude sempre il caricamento.
 - **`detectConflicts` esclude di proposito il limite di giorni lavorati**, che è un vincolo settimanale: non "correggerlo" aggiungendolo lì.
-- **Problema noto (round-trip).** Pubblica → ricarica perde campi dei job che lo scheduler usa: tra questi `manualEdited`, i `window*` di Hostaway e `templateLockedFromSheet`. Ogni nuovo campo dei job va verificato anche sul percorso di persistenza dell'Apps Script.
+- **Persistenza (round-trip).** Il backend salva e ripristina 45 colonne per job, inclusi i campi che lo scheduler usa: `manualEdited`, i `window*` di Hostaway, `templateLockedFromSheet` e simili. Un **nuovo** campo dei job che influisce sul comportamento va aggiunto anche a `COLUMNS`/`jobToRow`/`rowToJob` del backend, in coda. Altrimenti si perde a ogni pubblica → ricarica.
 
 ## Protocollo di consegna (handoff)
 
