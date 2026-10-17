@@ -33,6 +33,7 @@ CleanFlow pianifica i turni di pulizia di un portafoglio di affitti brevi a Malt
 8. **Direzione di evoluzione (no big-bang):** round-trip fedele → fixture/test → modello dati → core scheduler → qualità → back office.
    - **Non unificare** le implementazioni di eligibility (applicazione, pianificazione, diagnostica, trace): hanno scopi diversi.
    - Prima vanno caratterizzate.
+9. **Export intoccabili.** L'export Supervisor XLSX (layout, colori, evidenziazioni, template) e l'export When I Work non si modificano. Le supervisor stampano il primo e lo usano ogni giorno. Una nuova funzione deve produrre esattamente lo stesso output in questi export.
 
 ## Verifica obbligatoria per modifiche allo scheduler
 

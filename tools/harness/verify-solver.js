@@ -123,6 +123,23 @@ console.log('\n#### solver: diagnosi vs blocco');
     check(rejectedForMaxDays(opt, 'c5'), '(P2b) 6/5 preesistente + nuovo giorno: rifiutato');
   }
 }
+// P2c — a cleaner ALREADY on a full 2-person target job (replacement mode), already over
+// her cap (5 other days + the target day = 6/5): keeping her adds no day, so she must not
+// be rejected for max-days (the solver used to exclude the target job when counting days).
+{
+  const cA = cleanerWith('cA', 5), cB = cleanerWith('cB', 6);
+  const pX2 = { ...pX, id: 'pX2', cleanersRequired: 2, checkoutCleanersRequired: 2, requires2: true };
+  const E = curF.buildEngine({ ...START, cleaners: [cA, cB], properties: [pX, pX2],
+    training: { cA: ['pX', 'pX2'], cB: ['pX', 'pX2'] }, travelBuffers: {} });
+  const target = { ...checkout('TGT', 'Sun', 'assigned', ['cA', 'cB']), propertyId: 'pX2', cleanersRequired: 2 };
+  const plan = [...ALL_DAYS.slice(0, 5).map((d, i) => checkout('a' + i, d, 'assigned', ['cA'])), target];
+  const needed = E.getJobRequiredCleaners(target);
+  if (needed !== 2) check(false, `(P2c) setup: il job doveva richiedere 2 cleaner, ne richiede ${needed}`);
+  else {
+    const opt = E.buildLocalAssignmentOptions(target, plan, 0);
+    check(!rejectedForMaxDays(opt, 'cA'), '(P2c) cleaner gia nel job (6/5 preesistente): non scartata per i giorni');
+  }
+}
 
 console.log('\n#### conteggio giorni');
 {
