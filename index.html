@@ -2629,18 +2629,84 @@ const createDebugTraceCollector = ({ enabled, runId, weekOffset }) => {
 
 
 // ─── PUBLISHED SCHEDULE API (Google Apps Script Web App) ───────────────────
-// ⚠️ PILOT SECURITY NOTE (not production auth):
-// The login password (see pwInput check in the login screen) is a client-side
-// SOFT GATE for a trusted pilot only — the literal ships in the bundle and is
-// readable in DevTools. This Apps Script endpoint is deployed "Anyone with the
-// link" and accepts unauthenticated POSTs that REPLACE an entire week.
-// Acceptable ONLY because the deployment URL is private and shared with trusted
-// staff. For production this MUST be replaced with real auth (server-side secret
-// validation in Apps Script, or Google sign-in / Cloudflare Access).
-// Backend endpoint for shared schedule persistence across devices.
-// GET ?weekStartISO=YYYY-MM-DD  → fetch published schedule for that week
-// POST { weekStartISO, weekEndISO, publishedBy, jobs } → publish a week (v2)
+// Login is server-side (Auth.gs in the private backend repo): the app sends
+// username + password once (cfLogin), keeps the returned session token in
+// localStorage, and sends it with EVERY call in a text/plain POST body (Apps Script
+// cannot read custom headers; text/plain avoids a CORS preflight).
+// Actions: cfLogin, cfLogout, cfSession, cfGetPublished, cfPublish,
+// cfHostawayReservations (+ owner-only cfHostawayListings / cfTestHostaway).
+// "Published by" is set by the server from the session, never by the client.
 const PUBLISHED_API_URL = 'https://script.google.com/macros/s/AKfycbxak7U7rOsv96qzbl1kgizUbyWENh3a9NXsDiWyNRJHEPuDmZgkOPUVkXrqyG4ZV-RO/exec';
+
+// Dev only: on localhost a local mock backend can be used for end-to-end tests
+// (localStorage cf_api_url_dev). Ignored on every other host, production included.
+const getApiUrl = () => {
+  try {
+    if(/^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)){
+      const dev = localStorage.getItem('cf_api_url_dev');
+      if(dev) return dev;
+    }
+  } catch(e) {}
+  return PUBLISHED_API_URL;
+};
+
+// ─── Session (server-issued token, valid 7 days) ───────────────────────────
+const SESSION_KEY = 'cf_session_v1';
+const LAST_USER_KEY = 'cf_last_user';
+const getSession = () => {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    if(s && s.token && s.user && !(s.expiresAt && Date.parse(s.expiresAt) <= Date.now())) return s;
+  } catch(e) {}
+  return null;
+};
+const saveSession = (s) => { try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); localStorage.setItem(LAST_USER_KEY, s.user.username); } catch(e) {} };
+const clearSession = () => { try { localStorage.removeItem(SESSION_KEY); } catch(e) {} };
+const getLastUsername = () => { try { return localStorage.getItem(LAST_USER_KEY) || ''; } catch(e) { return ''; } };
+// Debug Center is for the owner only. It shows in-memory data the user already has,
+// so this is a UI gate; owner-only DATA is enforced by the server.
+const canSeeDebug = () => CLEANFLOW_DEBUG_CENTER_ENABLED && ((getSession() || {}).user || {}).role === 'superadmin';
+
+// Set by App: called when the server rejects the session (expired, revoked, user
+// disabled) so the login shows again without discarding in-memory work.
+let __cfOnAuthLost = null;
+// Set by App: called when the server requires the provisional password to be changed.
+let __cfOnMustChange = null;
+const CF_AUTH_LOST_CODES = ['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_INVALID_SESSION'];
+
+// Single entry point for every backend call. Never throws: failures come back as
+// { ok:false, error } (plus timeout:true on timeout), like the old fetch helpers.
+const cfApi = async (action, payload={}, { timeoutMs=60000 }={}) => {
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), timeoutMs);
+  try {
+    const s = getSession();
+    const sentToken = s ? s.token : undefined;
+    const res = await fetch(getApiUrl(), {
+      method:'POST',
+      redirect:'follow',
+      headers:{'Content-Type':'text/plain;charset=utf-8'}, // text/plain to avoid CORS preflight
+      body: JSON.stringify({ ...payload, action, token: s ? s.token : undefined }),
+      signal: controller.signal,
+    });
+    if(!res.ok) return { ok:false, error:`HTTP ${res.status}` };
+    const data = await res.json();
+    if(data && data.ok===false && CF_AUTH_LOST_CODES.includes(data.code)){
+      const current = getSession();
+      if(!current || current.token === sentToken){ // ignore replies about an older session
+        clearSession();
+        if(__cfOnAuthLost) __cfOnAuthLost(data.error);
+      }
+    }
+    if(data && data.code==='PASSWORD_CHANGE_REQUIRED' && __cfOnMustChange) __cfOnMustChange();
+    return data || { ok:false, error:'Risposta vuota dal server' };
+  } catch(e) {
+    if(e.name==='AbortError') return { ok:false, timeout:true, error:'Timeout: il server non ha risposto' };
+    return { ok:false, error: String(e.message||e) };
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 // Compute weekStartISO (Monday) from a weekOffset relative to current week
 const getWeekStartISO = (weekOffset=0) => toISODateLocal(getWeekDates(weekOffset)[0]);
@@ -2649,41 +2715,20 @@ const getWeekEndISO   = (weekOffset=0) => toISODateLocal(getWeekDates(weekOffset
 // Fetch published schedule for a given weekStartISO. Always resolves to a result object,
 // never throws — failure modes are reported via { ok:false, error } so callers can decide.
 const fetchPublishedSchedule = async (weekStartISO) => {
-  try {
-    const url = `${PUBLISHED_API_URL}?weekStartISO=${encodeURIComponent(weekStartISO)}`;
-    const res = await fetch(url, { method:'GET', redirect:'follow' });
-    if(!res.ok) return { ok:false, error:`HTTP ${res.status}` };
-    const data = await res.json();
-    if(!data || data.ok!==true) return { ok:false, error:(data&&data.error)||'Unknown API error' };
-    return data; // { ok, exists, weekStartISO, weekEndISO, snapshotId, publishedAt, publishedBy, jobs }
-  } catch(e) {
-    return { ok:false, error: String(e.message||e) };
-  }
+  const data = await cfApi('cfGetPublished', { weekStartISO });
+  if(!data || data.ok!==true) return { ok:false, error:(data&&data.error)||'Unknown API error' };
+  return data; // { ok, exists, weekStartISO, weekEndISO, snapshotId, publishedAt, publishedBy, jobs }
 };
 
 // POST current jobs to the backend. Replaces the entire week atomically server-side.
+// `publishedBy` stays in the signature for the callers but is NOT sent: the server
+// takes it from the logged-in session.
 const publishScheduleToBackend = async (weekStartISO, weekEndISO, publishedBy, jobs, baseSnapshotId=null) => {
-  const controller = new AbortController();
-  const timer = setTimeout(()=>controller.abort(), 30000);
-  try {
-    const res = await fetch(PUBLISHED_API_URL, {
-      method:'POST',
-      redirect:'follow',
-      headers:{'Content-Type':'text/plain;charset=utf-8'}, // text/plain to avoid CORS preflight
-      body: JSON.stringify({ weekStartISO, weekEndISO, publishedBy, jobs, baseSnapshotId }),
-      signal: controller.signal,
-    });
-    if(!res.ok) return { ok:false, error:`HTTP ${res.status}` };
-    const data = await res.json();
-    // Pass through conflict payload as-is so the caller can show details.
-    if(!data || data.ok!==true) return data && data.error ? data : { ok:false, error:(data&&data.error)||'Unknown API error' };
-    return data; // { ok, snapshotId, publishedAt, rowCount, weekStartISO, weekEndISO }
-  } catch(e) {
-    if(e.name==='AbortError') return { ok:false, error:'Timeout pubblicazione: backend non ha risposto entro 30s' };
-    return { ok:false, error: String(e.message||e) };
-  } finally {
-    clearTimeout(timer);
-  }
+  const data = await cfApi('cfPublish', { weekStartISO, weekEndISO, jobs, baseSnapshotId }, { timeoutMs:30000 });
+  if(data && data.timeout) return { ok:false, error:'Timeout pubblicazione: backend non ha risposto entro 30s' };
+  // Pass through conflict payload as-is so the caller can show details.
+  if(!data || data.ok!==true) return data && data.error ? data : { ok:false, error:(data&&data.error)||'Unknown API error' };
+  return data; // { ok, snapshotId, publishedAt, rowCount, weekStartISO, weekEndISO, publishedBy }
 };
 
 // ─── Operational job normalization for dirty-comparison ────────────────────
@@ -9795,6 +9840,45 @@ function Toast({toast}){
   );
 }
 
+// Change-password form: used for the forced first-login change (dark card) and from
+// the "Password" button (inside Modal). The server checks the current password.
+function ChangePasswordForm({ dark=false, knownCurrent='', onDone, onCancel, cancelLabel='Annulla' }){
+  const [cur,setCur]=useState('');
+  const [nw,setNw]=useState('');
+  const [nw2,setNw2]=useState('');
+  const [err,setErr]=useState('');
+  const [busy,setBusy]=useState(false);
+  const submit=async()=>{
+    if(busy) return;
+    const current=knownCurrent||cur;
+    if(!current){ setErr('Inserisci la password attuale'); return; }
+    if(nw.length<10){ setErr('La nuova password deve avere almeno 10 caratteri'); return; }
+    if(nw!==nw2){ setErr('Le due password nuove non coincidono'); return; }
+    setBusy(true); setErr('');
+    const r=await cfApi('cfChangePassword',{ currentPassword:current, newPassword:nw });
+    setBusy(false);
+    if(!r||r.ok!==true){ setErr((r&&r.error)||'Cambio password non riuscito'); return; }
+    const sess=getSession(); if(sess) saveSession({ ...sess, user:{ ...sess.user, ...(r.user||{}) } });
+    setCur(''); setNw(''); setNw2('');
+    if(onDone) onDone();
+  };
+  const field={width:'100%',padding:'12px 14px',borderRadius:12,fontSize:15,fontFamily:'inherit',marginBottom:10,outline:'none',
+    border:dark?'1.5px solid rgba(255,255,255,0.18)':'1.5px solid #DDD',background:dark?'#141414':'white',color:dark?'#F7F3EC':'#1A1A1A'};
+  const onKey=e=>{ if(e.key==='Enter') submit(); };
+  return(
+    <div style={{textAlign:'left'}}>
+      {!dark&&<div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,marginBottom:6}}>Cambia password</div>}
+      {!dark&&<div style={{fontSize:13,color:'#666',marginBottom:16,lineHeight:1.5}}>Almeno 10 caratteri. Gli altri dispositivi collegati con il tuo utente verranno disconnessi.</div>}
+      {!knownCurrent&&<input type="password" placeholder="Password attuale" autoComplete="current-password" value={cur} onChange={e=>{setCur(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>}
+      <input type="password" placeholder="Nuova password" autoComplete="new-password" value={nw} onChange={e=>{setNw(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>
+      <input type="password" placeholder="Ripeti la nuova password" autoComplete="new-password" value={nw2} onChange={e=>{setNw2(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>
+      {err&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>{err}</div>}
+      <button onClick={submit} disabled={busy} style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:busy?'wait':'pointer',opacity:busy?0.7:1,fontFamily:'inherit'}}>{busy?'Salvataggio…':'Salva nuova password'}</button>
+      {onCancel&&<button onClick={onCancel} disabled={busy} style={{width:'100%',padding:'10px',marginTop:8,borderRadius:12,background:'transparent',color:dark?'rgba(255,255,255,0.55)':'#666',fontWeight:700,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>{cancelLabel}</button>}
+    </div>
+  );
+}
+
 function Modal({children,onClose}){
   return(
     <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:300,display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
@@ -10161,11 +10245,9 @@ function HostawayModal({onImport,onClose,weekOffset=0}){
     try{
       const startDate=getWeekStartISO(weekOffset);
       const endDate=getWeekEndISO(weekOffset);
-      const url=`${PUBLISHED_API_URL}?action=hostawayReservations&startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`;
-      const res=await fetch(url,{redirect:'follow'});
-      const data=await res.json();
+      const data=await cfApi('cfHostawayReservations',{startDate,endDate},{timeoutMs:120000});
       if(!data||data.ok!==true){
-        setApiError('Errore API: '+((data&&data.error)||('HTTP '+res.status))+(data&&data.stage?` (${data.stage})`:''));
+        setApiError('Errore API: '+((data&&data.error)||'risposta non valida')+(data&&data.stage?` (${data.stage})`:''));
         setApiLoading(false);
         return;
       }
@@ -11743,7 +11825,7 @@ function WIWExportModal({jobs,weekOffset,wf,conflicts,showToast,planningWeekOffs
 
 // ── DESKTOP SIDEBAR ────────────────────────────────────────────────────────────
 function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conflicts,onGenerate,onConflictDay,setModal,dataReady,genGate,refreshSheetData,sheetLoading,onLastMinute,supervisorName,onChangeSupervisorName,onPublish,publishing,publishedStatus,weekMismatchActive,showToast}){
-  const NAV=[{id:'week',icon:'📅',label:'Settimana'},{id:'day',icon:'📋',label:'Giorno'},{id:'props',icon:'🏢',label:'Proprietà'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI Chat'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(CLEANFLOW_DEBUG_CENTER_ENABLED?[{id:'debug',icon:'🧪',label:'Debug Center'}]:[])];
+  const NAV=[{id:'week',icon:'📅',label:'Settimana'},{id:'day',icon:'📋',label:'Giorno'},{id:'props',icon:'🏢',label:'Proprietà'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI Chat'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(canSeeDebug()?[{id:'debug',icon:'🧪',label:'Debug Center'}]:[])];
   const unassigned=jobs.filter(j=>j.cleanerIds.length===0).length;
   // Same real-conflict taxonomy as WeekView (staffing/gender excluded) — shared
   // helpers defined near detectConflicts() so the two never drift apart.
@@ -11839,7 +11921,8 @@ function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conf
         </button>
         <div style={{display:'flex',alignItems:'center',gap:6,fontSize:11,color:'#9FB6CC',marginTop:2}}>
           <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>👤 Supervisor: {supervisorName||'non impostato'}</span>
-          <button onClick={onChangeSupervisorName} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Cambia</button>
+          <button onClick={()=>setModal('changePassword')} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Password</button>
+          <button onClick={onChangeSupervisorName} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Esci</button>
         </div>
       </div>
     </div>
@@ -12790,12 +12873,12 @@ function App(){
       }
     });
   },[jobs]);
-  // Initial view. ?view=debug is honoured ONLY when the Debug Center flag is on;
-  // with the flag off the parameter is ignored and the normal initial view loads.
+  // Initial view. ?view=debug is honoured ONLY for the owner (superadmin session)
+  // with the Debug Center flag on; otherwise the normal initial view loads.
   // Deliberate scope choice: the URL is READ once at mount and never rewritten on
   // internal navigation, so refresh / back button / existing query strings are untouched.
   const [tab,          setTab         ]=useState(()=>{
-    if(CLEANFLOW_DEBUG_CENTER_ENABLED){
+    if(canSeeDebug()){
       try{ if(new URLSearchParams(window.location.search).get('view')==='debug') return 'debug'; }
       catch(e){ /* URL not parseable — fall back to the normal initial view */ }
     }
@@ -12819,9 +12902,18 @@ function App(){
   const [aiLoad,       setAiLoad      ]=useState(false);
   const [toast,        setToast       ]=useState(null);
   const [apiKeyInput,  setApiKeyInput ]=useState('');
-  const [authed,       setAuthed      ]=useState(()=>sessionStorage.getItem('cf_auth')==='1');
+  // Real login (server-side). An unexpired stored session opens the app directly;
+  // the server still validates the token on every call.
+  const [authed,       setAuthed      ]=useState(()=>!!getSession());
+  const [loginUser,    setLoginUser   ]=useState(()=>getLastUsername());
   const [pwInput,      setPwInput     ]=useState('');
-  const [pwError,      setPwError     ]=useState(false);
+  const [pwError,      setPwError     ]=useState('');
+  const [loggingIn,    setLoggingIn   ]=useState(false);
+  const [authLost,     setAuthLost    ]=useState(null); // set when the server rejects the session mid-use
+  const [authEpoch,    setAuthEpoch   ]=useState(0);    // bumped on every login: refetches the published week
+  // Provisional (owner-set) password: must be replaced before using the app.
+  const [mustChangePw, setMustChangePw]=useState(()=>!!(((getSession()||{}).user||{}).mustChangePassword));
+  const provisionalPwRef=useRef(''); // the password just typed at login, in memory only
   const [sheetStatus,  setSheetStatus ]=useState('loading'); // 'loading'|'ok'|'warn'|'error'
   const [sheetLoading, setSheetLoading]=useState(false);
   const dataReady = sheetStatus==='ok';
@@ -12865,16 +12957,40 @@ function App(){
   // Set true after a publish conflict + snapshot refetch. Makes the NEXT publish
   // confirm carry a strong "you are overwriting a newer version" warning.
   const [serverVersionChanged, setServerVersionChanged]=useState(false);
-  // Supervisor name surfaced in UI (label + Cambia action). Mirrors localStorage.
-  const [supervisorNameUI, setSupervisorNameUI]=useState(()=>getSupervisorName());
-  const changeSupervisorName = () => {
-    const entered = prompt('Il tuo nome supervisor:', supervisorNameUI||'');
-    if(entered===null) return;            // cancelled → keep existing
-    const trimmed = entered.trim();
-    if(!trimmed) return;                   // empty → keep existing
-    setSupervisorName(trimmed);
-    setSupervisorNameUI(trimmed);
+  // Supervisor shown in the UI = the logged-in user (the server sets "pubblicato da").
+  const [supervisorNameUI, setSupervisorNameUI]=useState(()=>((getSession()||{}).user||{}).displayName || getSupervisorName());
+  const doLogin = async () => {
+    if(loggingIn) return;
+    const username = loginUser.trim(), password = pwInput;
+    if(!username || !password){ setPwError('Inserisci nome utente e password'); return; }
+    setLoggingIn(true); setPwError('');
+    const r = await cfApi('cfLogin', { username, password });
+    setLoggingIn(false);
+    if(!r || r.ok!==true || !r.token){ setPwError((r&&r.error)||'Accesso non riuscito'); return; }
+    saveSession({ token:r.token, user:r.user, expiresAt:r.expiresAt });
+    const mustChange = !!(r.user && r.user.mustChangePassword);
+    provisionalPwRef.current = mustChange ? password : '';
+    setMustChangePw(mustChange);
+    setSupervisorName(r.user.displayName);
+    setSupervisorNameUI(r.user.displayName);
+    setPwInput('');
+    setAuthLost(null);
+    setAuthEpoch(e=>e+1);
+    setAuthed(true);
   };
+  const doLogout = async () => {
+    if(!confirm('Vuoi uscire da CleanFlow su questo dispositivo?')) return;
+    await cfApi('cfLogout', {});
+    clearSession();
+    window.location.reload(); // drop everything held in memory (shared devices)
+  };
+  // The server rejected the session mid-use: show the login again. App state (the
+  // week in progress) is kept, because `authed` does not change.
+  useEffect(()=>{
+    __cfOnAuthLost = (msg) => setAuthLost(msg || 'Sessione scaduta: accedi di nuovo.');
+    __cfOnMustChange = () => setMustChangePw(true);
+    return ()=>{ __cfOnAuthLost = null; __cfOnMustChange = null; };
+  },[]);
   // Initial-load guard: don't autosave during the first published+draft decision
   const initialLoadDoneRef = useRef(false);
   const publishingRef = useRef(false);
@@ -13097,7 +13213,7 @@ function App(){
       setTimeout(()=>{ if(!cancelled) initialLoadDoneRef.current = true; }, 0);
     });
     return ()=>{ cancelled=true; };
-  },[authed,weekOffset]);
+  },[authed,weekOffset,authEpoch]);
 
   const conflicts=useMemo(()=>detectConflicts(jobs),[jobs,dataVersion]);
   const totalC=conflicts.size;
@@ -13122,10 +13238,15 @@ function App(){
     } else {
       const hasLocalWork = jobs.some(j=>j.source!=='last_minute');
       if(!hasLocalWork) return;
-      const handle = setTimeout(()=>{ saveDraft(weekStartISO, jobs, null); }, 400);
+      // Server state unknown (load failed: offline, session lost): keep the base of an
+      // existing draft so a draft tied to a published snapshot is not downgraded to
+      // local-only (the next successful load would discard it).
+      const existingDraft = publishedStatus==='error' ? loadDraft(weekStartISO) : null;
+      const keepBase = existingDraft && existingDraft.basePublishedAt ? existingDraft.basePublishedAt : null;
+      const handle = setTimeout(()=>{ saveDraft(weekStartISO, jobs, keepBase); }, 400);
       return ()=>clearTimeout(handle);
     }
-  },[jobs, dirty, publishedJobsSnapshot, weekMismatchActive, authed, weekOffset]);
+  },[jobs, dirty, publishedJobsSnapshot, weekMismatchActive, authed, weekOffset, publishedStatus]);
 
   useEffect(()=>{
     if(!dirty || !publishedJobsSnapshot) return;
@@ -13210,7 +13331,7 @@ function App(){
       return;
     }
 
-    let supervisorName = getSupervisorName();
+    let supervisorName = ((getSession()||{}).user||{}).displayName || getSupervisorName();
     if(!supervisorName){
       const entered = prompt('Il tuo nome supervisor (apparirà sul piano pubblicato):', '');
       supervisorName = (entered||'').trim();
@@ -13293,7 +13414,7 @@ function App(){
     const meta = {
       snapshotId: result.snapshotId,
       publishedAt: result.publishedAt,
-      publishedBy: supervisorName,
+      publishedBy: result.publishedBy || supervisorName,
       weekStartISO: result.weekStartISO,
       weekEndISO: result.weekEndISO,
     };
@@ -14229,32 +14350,54 @@ function App(){
     });
   };
 
-  const NAV=[{id:'week',icon:'📅',label:'Sett.'},{id:'day',icon:'📋',label:DAY_IT[selDay]},{id:'props',icon:'🏢',label:'Prop.'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(CLEANFLOW_DEBUG_CENTER_ENABLED?[{id:'debug',icon:'🧪',label:'Debug'}]:[])];
+  const NAV=[{id:'week',icon:'📅',label:'Sett.'},{id:'day',icon:'📋',label:DAY_IT[selDay]},{id:'props',icon:'🏢',label:'Prop.'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(canSeeDebug()?[{id:'debug',icon:'🧪',label:'Debug'}]:[])];
 
   // ── LOGIN SCREEN — after all hooks ────────────────────────────────────────
-  if(!authed) return(
+  // Also shown when the server rejected the session mid-use (authLost): App state is
+  // kept, so after logging in again the week in progress is still there.
+  if(!authed || authLost) return(
     <div style={{minHeight:'100vh',background:'#F5F2EE',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Nunito',sans-serif"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
       <div style={{background:'#0A0A0A',borderRadius:24,padding:'44px 36px',width:'100%',maxWidth:380,boxShadow:'0 18px 50px rgba(0,0,0,0.22)',border:'1px solid rgba(255,255,255,0.10)',textAlign:'center'}}>
         <img src="./arco-collection.jpeg" alt="Arco Collection" style={{display:'block',width:'100%',maxWidth:240,margin:'0 auto 22px',filter:'invert(1)'}} />
         <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800,color:'#F7F3EC',letterSpacing:'-0.5px',marginBottom:4}}>CleanFlow</div>
         <div style={{fontSize:12,color:'rgba(255,255,255,0.45)',letterSpacing:1,marginBottom:28}}>Scheduling · Malta</div>
+        {authLost&&<div style={{fontSize:12,color:'#F7C77A',fontWeight:700,marginBottom:14,lineHeight:1.4}}>{authLost}<br/>Il lavoro in corso su questo dispositivo è conservato.</div>}
+        <input type="text" value={loginUser}
+          onChange={e=>{setLoginUser(e.target.value);setPwError('');}}
+          placeholder="Nome utente" autoFocus={!loginUser} autoComplete="username" autoCapitalize="none" autoCorrect="off" spellCheck={false}
+          style={{width:'100%',padding:'13px 16px',borderRadius:12,border:`1.5px solid ${pwError?C.conflict:'rgba(255,255,255,0.18)'}`,background:'#141414',color:'#F7F3EC',fontSize:16,textAlign:'center',fontFamily:'inherit',marginBottom:10,outline:'none'}}
+        />
         <input type="password" value={pwInput}
-          onChange={e=>{setPwInput(e.target.value);setPwError(false);}}
-          onKeyDown={e=>{if(e.key==='Enter'){if(pwInput==='172390'){sessionStorage.setItem('cf_auth','1');setAuthed(true);}else setPwError(true);}}}
-          placeholder="Password" autoFocus
+          onChange={e=>{setPwInput(e.target.value);setPwError('');}}
+          onKeyDown={e=>{if(e.key==='Enter')doLogin();}}
+          placeholder="Password" autoFocus={!!loginUser} autoComplete="current-password"
           style={{width:'100%',padding:'13px 16px',borderRadius:12,border:`1.5px solid ${pwError?C.conflict:'rgba(255,255,255,0.18)'}`,background:'#141414',color:'#F7F3EC',fontSize:16,textAlign:'center',letterSpacing:4,fontFamily:'inherit',marginBottom:10,outline:'none'}}
         />
-        {pwError&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>Password errata</div>}
-        <button onClick={()=>{if(pwInput==='172390'){sessionStorage.setItem('cf_auth','1');setAuthed(true);}else setPwError(true);}}
+        {pwError&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>{pwError}</div>}
+        <button onClick={doLogin} disabled={loggingIn}
           onMouseDown={e=>e.currentTarget.style.background='#B9825A'} onMouseUp={e=>e.currentTarget.style.background='#A66A43'}
-          style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:'pointer',fontFamily:'inherit'}}>
-          Accedi
+          style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:loggingIn?'wait':'pointer',opacity:loggingIn?0.7:1,fontFamily:'inherit'}}>
+          {loggingIn?'Accesso…':'Accedi'}
         </button>
       </div>
     </div>
   );
 
+
+  // Provisional password (set by the owner): the user picks their own before the app opens.
+  if(mustChangePw) return(
+    <div style={{minHeight:'100vh',background:'#F5F2EE',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Nunito',sans-serif"}}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
+      <div style={{background:'#0A0A0A',borderRadius:24,padding:'40px 32px',width:'100%',maxWidth:400,boxShadow:'0 18px 50px rgba(0,0,0,0.22)',border:'1px solid rgba(255,255,255,0.10)',textAlign:'center'}}>
+        <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:'#F7F3EC',marginBottom:8}}>Imposta la tua password</div>
+        <div style={{fontSize:13,color:'rgba(255,255,255,0.6)',lineHeight:1.5,marginBottom:22}}>Stai usando una password provvisoria. Scegline una tua (almeno 10 caratteri): da ora la conoscerai solo tu.</div>
+        <ChangePasswordForm dark knownCurrent={provisionalPwRef.current}
+          onDone={()=>{ provisionalPwRef.current=''; setMustChangePw(false); setAuthEpoch(e=>e+1); showToast('Password impostata','ok'); }}
+          onCancel={doLogout} cancelLabel="Esci"/>
+      </div>
+    </div>
+  );
 
   const dataEssentialsMissing = PROPERTIES.length===0 || CLEANERS.length===0;
 
@@ -14305,7 +14448,7 @@ function App(){
       {/* Debug Center — read-only diagnostics. Receives the SAME source-of-truth state
           the rest of the app renders (jobs/conflicts, not the week-mismatch-blanked
           visibleJobs) and never receives a setter. */}
-      {CLEANFLOW_DEBUG_CENTER_ENABLED&&tab==='debug'&&<DebugCenter
+      {canSeeDebug()&&tab==='debug'&&<DebugCenter
         jobs={jobs} weekOffset={weekOffset} conflicts={conflicts}
         cleaners={CLEANERS} properties={PROPERTIES} training={TRAINING} travelBuffers={TRAVEL_BUFFERS}
         showToast={showToast} dataVersion={dataVersion} isDesktop={isDesktop}
@@ -14323,7 +14466,7 @@ function App(){
       {isDesktop?(
         // ── DESKTOP LAYOUT ──
         <div style={{display:'flex',height:'100vh',overflow:'hidden'}}>
-          <Sidebar tab={tab} setTab={setTab} selDay={selDay} weekOffset={weekOffset} setWeekOffset={setWeekOffset} wf={wf} totalC={visibleTotalC} jobs={visibleJobs} conflicts={visibleConflicts} onGenerate={handleGenerate} onConflictDay={goToConflictDay} setModal={setModal} dataReady={dataReady} genGate={genGate} refreshSheetData={refreshSheetData} sheetLoading={sheetLoading} onLastMinute={openLastMinuteModal} supervisorName={supervisorNameUI} onChangeSupervisorName={changeSupervisorName} onPublish={()=>publishCurrentSchedule()} publishing={publishing} publishedStatus={publishedStatus} weekMismatchActive={weekMismatchActive} showToast={showToast}/>
+          <Sidebar tab={tab} setTab={setTab} selDay={selDay} weekOffset={weekOffset} setWeekOffset={setWeekOffset} wf={wf} totalC={visibleTotalC} jobs={visibleJobs} conflicts={visibleConflicts} onGenerate={handleGenerate} onConflictDay={goToConflictDay} setModal={setModal} dataReady={dataReady} genGate={genGate} refreshSheetData={refreshSheetData} sheetLoading={sheetLoading} onLastMinute={openLastMinuteModal} supervisorName={supervisorNameUI} onChangeSupervisorName={doLogout} onPublish={()=>publishCurrentSchedule()} publishing={publishing} publishedStatus={publishedStatus} weekMismatchActive={weekMismatchActive} showToast={showToast}/>
           <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column',overflow:'hidden'}}>
             {/* Published schedule status banner (desktop) */}
             <PublishedScheduleBanner
@@ -14429,7 +14572,8 @@ function App(){
             </div>
             <div style={{display:'flex',alignItems:'center',gap:8,marginTop:8,fontSize:11,color:'#9FB6CC'}}>
               <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>👤 Supervisor: {supervisorNameUI||'non impostato'}</span>
-              <button onClick={changeSupervisorName} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Cambia</button>
+              <button onClick={()=>setModal('changePassword')} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Password</button>
+              <button onClick={doLogout} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Esci</button>
             </div>
           </div>
 
@@ -14562,6 +14706,7 @@ function App(){
 
       {modal==='hostaway'&&<Modal onClose={()=>setModal(null)}><HostawayModal onImport={doImportHostaway} onClose={()=>setModal(null)} weekOffset={weekOffset}/></Modal>}
       {modal==='generateResult'&&<Modal onClose={()=>{setModal(null);setGenerateResult(null);}}><GenerateModal result={generateResult} constraints={generateResult?.constraints} onConfirm={applyGenerate} onClose={()=>{setModal(null);setGenerateResult(null);}} onGenerate={(startDay,endDay)=>handleGenerate(startDay,endDay)} generating={isGenerating}/></Modal>}
+      {modal==='changePassword'&&<Modal onClose={()=>setModal(null)}><ChangePasswordForm onDone={()=>{setModal(null);showToast('Password cambiata. Gli altri dispositivi collegati sono stati disconnessi.','ok');}} onCancel={()=>setModal(null)}/></Modal>}
       {isGenerating&&(
         <div style={{position:'fixed',inset:0,zIndex:500,background:'rgba(0,0,0,0.45)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12,color:'#fff'}}>
           <div style={{fontSize:34,animation:'spin 1.2s linear infinite'}}>⟳</div>
