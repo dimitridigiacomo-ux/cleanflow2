@@ -1,0 +1,8 @@
+{
+  "name": "cleanflow-build",
+  "private": true,
+  "description": "Deploy-time JSX precompile for index.html (see precompile.js). Babel version must match the babel-standalone CDN tag in index.html.",
+  "dependencies": {
+    "@babel/standalone": "7.23.2"
+  }
+}
