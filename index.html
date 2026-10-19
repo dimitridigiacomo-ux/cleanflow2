@@ -9879,12 +9879,36 @@ function ChangePasswordForm({ dark=false, knownCurrent='', onDone, onCancel, can
   );
 }
 
+// Error boundary: if a view, a modal or the whole app throws while rendering, show a
+// message in its place instead of a blank page. Rendering errors never change state,
+// so nothing is lost: the rest of the app keeps working. "Riprova" re-renders it.
+class ViewBoundary extends React.Component {
+  constructor(props){ super(props); this.state={ error:null }; }
+  static getDerivedStateFromError(error){ return { error }; }
+  componentDidCatch(error, info){ console.error('[CleanFlow] crash in '+(this.props.name||'view'), error, info && info.componentStack); }
+  render(){
+    const err=this.state.error;
+    if(!err) return this.props.children;
+    const root=!!this.props.root;
+    let detail=null;
+    try { if(canSeeDebug()) detail=String((err&&err.message)||err).slice(0,300); } catch(e) {}
+    return(
+      <div role="alert" style={{margin:root?'40px auto':'16px',maxWidth:520,padding:'20px 22px',borderRadius:16,background:'#FFF8E6',border:'2px solid #F0C36D',color:'#5C4200',fontFamily:"'Nunito',sans-serif"}}>
+        <div style={{fontSize:16,fontWeight:800,marginBottom:6}}>⚠️ {root?'CleanFlow ha avuto un problema':('Questa sezione ha avuto un problema'+(this.props.name?' ('+this.props.name+')':''))}</div>
+        <div style={{fontSize:13,lineHeight:1.5,marginBottom:12}}>{root?'Ricarica la pagina. Le bozze salvate sul dispositivo restano.':'I dati non sono stati modificati e il resto dell\'app funziona: puoi cambiare vista, salvare e pubblicare.'}</div>
+        {detail&&<div style={{fontSize:11,fontFamily:'monospace',background:'rgba(0,0,0,0.05)',borderRadius:8,padding:'6px 8px',marginBottom:12,wordBreak:'break-word'}}>{detail}</div>}
+        <button onClick={()=>root?window.location.reload():this.setState({error:null})} style={{padding:'9px 16px',borderRadius:10,background:'#A66A43',color:'white',fontWeight:800,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>{root?'Ricarica':'Riprova'}</button>
+      </div>
+    );
+  }
+}
+
 function Modal({children,onClose}){
   return(
     <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:300,display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
       <div style={{background:C.card,borderRadius:'22px 22px 0 0',padding:'8px 24px 36px',width:'100%',maxWidth:600,maxHeight:'93vh',overflowY:'auto'}}>
         <div style={{width:40,height:4,background:'#DDD',borderRadius:2,margin:'12px auto 20px'}}/>
-        {children}
+        <ViewBoundary name="finestra">{children}</ViewBoundary>
       </div>
     </div>
   );
@@ -14439,22 +14463,22 @@ function App(){
           </div>
         </div>
       ) : (<>
-      {tab==='week'&&<WeekView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDaySelect={d=>{setSelDay(d);setTab('day');}} onConflictDay={goToConflictDay} onLoadTemplate={()=>setModal('template')} onImportHostaway={()=>setModal('hostaway')} onGenerate={handleGenerate} wf={wf} dataReady={dataReady} genGate={genGate} trainingOk={trainingStatus.ok} trainingMissing={trainingStatus.propertiesWithoutTraining.length} trainingMissingJobs={trainingStatus.jobsWithoutTraining.length} onApplyFallback={applyFallbackReallocation}/>}
-      {tab==='day'&&<DayView jobs={visibleJobs} conflicts={visibleConflicts} day={selDay} setDay={d=>{setSelDay(d);setHighlightJob(null);}} weekOffset={weekOffset} onAdd={openAdd} onEdit={openEdit} onFix={fixConflict} onFindSolution={findSolution} highlightJobId={highlightJob} setHighlightJob={setHighlightJob} onLoadTemplate={()=>setModal('template')} onCleanerClick={openCleanerWeek}/>}
-      {tab==='props'&&<PropertiesView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDayAndJobSelect={(day,jobId)=>{setSelDay(day);setHighlightJob(jobId);setTab('day');}}/>}
-      {tab==='cleaners'&&<CleanersView jobs={visibleJobs} selDay={selDay} weekOffset={weekOffset} onDaySelect={d=>setSelDay(d)} dataVersion={dataVersion}/>}
+      {tab==='week'&&<ViewBoundary name="Settimana"><WeekView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDaySelect={d=>{setSelDay(d);setTab('day');}} onConflictDay={goToConflictDay} onLoadTemplate={()=>setModal('template')} onImportHostaway={()=>setModal('hostaway')} onGenerate={handleGenerate} wf={wf} dataReady={dataReady} genGate={genGate} trainingOk={trainingStatus.ok} trainingMissing={trainingStatus.propertiesWithoutTraining.length} trainingMissingJobs={trainingStatus.jobsWithoutTraining.length} onApplyFallback={applyFallbackReallocation}/></ViewBoundary>}
+      {tab==='day'&&<ViewBoundary name="Giorno"><DayView jobs={visibleJobs} conflicts={visibleConflicts} day={selDay} setDay={d=>{setSelDay(d);setHighlightJob(null);}} weekOffset={weekOffset} onAdd={openAdd} onEdit={openEdit} onFix={fixConflict} onFindSolution={findSolution} highlightJobId={highlightJob} setHighlightJob={setHighlightJob} onLoadTemplate={()=>setModal('template')} onCleanerClick={openCleanerWeek}/></ViewBoundary>}
+      {tab==='props'&&<ViewBoundary name="Proprietà"><PropertiesView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDayAndJobSelect={(day,jobId)=>{setSelDay(day);setHighlightJob(jobId);setTab('day');}}/></ViewBoundary>}
+      {tab==='cleaners'&&<ViewBoundary name="Team"><CleanersView jobs={visibleJobs} selDay={selDay} weekOffset={weekOffset} onDaySelect={d=>setSelDay(d)} dataVersion={dataVersion}/></ViewBoundary>}
       </>)}
       {AI_ENABLED&&tab==='chat'&&<ChatView msgs={msgs} chatIn={chatIn} setChatIn={setChatIn} onSend={sendChat} isLoading={aiLoad} chatRef={chatRef} onApplySuggestion={applySuggestion}/>}
       {/* Debug Center — read-only diagnostics. Receives the SAME source-of-truth state
           the rest of the app renders (jobs/conflicts, not the week-mismatch-blanked
           visibleJobs) and never receives a setter. */}
-      {canSeeDebug()&&tab==='debug'&&<DebugCenter
+      {canSeeDebug()&&tab==='debug'&&<ViewBoundary name="Debug Center"><DebugCenter
         jobs={jobs} weekOffset={weekOffset} conflicts={conflicts}
         cleaners={CLEANERS} properties={PROPERTIES} training={TRAINING} travelBuffers={TRAVEL_BUFFERS}
         showToast={showToast} dataVersion={dataVersion} isDesktop={isDesktop}
         debugTrace={lastDebugTrace}
         replayFixture={lastReplayFixture}
-        onBack={()=>setTab('week')}/>}
+        onBack={()=>setTab('week')}/></ViewBoundary>}
     </div>
   );
 
@@ -14868,4 +14892,4 @@ function App(){
   );
 }
 
-const root = ReactDOM.createRoot(document.getElementById('root')); root.render(<App />);</script></body></html>
+const root = ReactDOM.createRoot(document.getElementById('root')); root.render(<ViewBoundary root name="app"><App /></ViewBoundary>);</script></body></html>
