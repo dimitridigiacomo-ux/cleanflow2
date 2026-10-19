@@ -3,3 +3,6 @@
 .claude/launch.json
 # Output temporanei
 *.out
+
+# build dependencies (tools/build)
+node_modules/
