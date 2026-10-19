@@ -27,8 +27,14 @@ const fail = msg => { console.error('PRECOMPILE FAILED: ' + msg); process.exit(1
 
 const html = fs.readFileSync(inPath, 'utf8');
 
+// 0) Every external script must carry an integrity hash (SRI): the browser then refuses
+//    a CDN file that is not byte-for-byte the expected one.
+const external = [...html.matchAll(/<script\b[^>]*\bsrc="https?:[^>]*>/g)].map(m => m[0]);
+const unsigned = external.filter(t => !/\bintegrity="sha(256|384|512)-[A-Za-z0-9+/=]+"/.test(t) || !/\bcrossorigin="anonymous"/.test(t));
+if (unsigned.length) fail('external script without integrity/crossorigin: ' + unsigned.join(' '));
+
 // 1) The Babel CDN tag must name the version we compile with.
-const cdnRe = /<script src="https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/babel-standalone\/([\d.]+)\/babel\.min\.js"><\/script>/g;
+const cdnRe = /<script src="https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/babel-standalone\/([\d.]+)\/babel\.min\.js"[^>]*><\/script>/g;
 const cdn = [...html.matchAll(cdnRe)];
 if (cdn.length !== 1) fail(`expected 1 babel-standalone CDN tag, found ${cdn.length}`);
 if (cdn[0][1] !== Babel.version) fail(`index.html loads Babel ${cdn[0][1]} but the build has ${Babel.version}: update tools/build/package.json`);
