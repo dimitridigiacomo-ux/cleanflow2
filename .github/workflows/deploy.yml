@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      precompile:
+        description: 'Precompile JSX (false = publish index.html as is, with in-browser Babel)'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -26,6 +31,21 @@ jobs:
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
+
+      # Translate the JSX once here instead of in every browser (see tools/build/precompile.js).
+      # Only the published copy of index.html changes; any mismatch fails the deploy.
+      - name: Setup Node
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.precompile }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Precompile JSX
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.precompile }}
+        run: |
+          npm ci --prefix tools/build --no-audit --no-fund
+          node tools/build/precompile.js index.html index.html
+          rm -rf tools/build/node_modules
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
