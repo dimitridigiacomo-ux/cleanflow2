@@ -3159,6 +3159,98 @@ const generateApiJobsFromReservations = (reservations, weekOffset=0, mapById=HOS
   return { jobs, diagnostics };
 };
 
+// ── HOSTAWAY RE-IMPORT MERGE ──────────────────────────────────────────────────
+// A second "Importa Hostaway" for the same week must not throw the plan away. Duties that
+// are still the same keep their people and manual changes; only what Hostaway changed is
+// updated; new bookings are added unassigned; duties no longer in Hostaway are only
+// reported, never removed here (the supervisor decides).
+// Pairing an imported row with a planned duty, in this order (one-to-one):
+//  1. same date + property + type (checkout on the departure day, checkin on the arrival
+//     day) AND identical Hostaway data, so two duties sharing a key never swap data;
+//  2. same date + property + type, remaining ones in order;
+//  3. same booking number ("Res N" in the generated note) and type: a duty moved to
+//     another day by hand.
+// What is compared, and why:
+//  - guests: display data, refreshed and reported;
+//  - service type and time window (flexible duties) or start time (fixed duties): the
+//    Hostaway-owned timing. For flexible duties the scheduler picks startTime inside the
+//    window, so startTime itself is NOT compared; it only moves when it falls outside the
+//    new window. Never applied to manual/rescue duties: those are reported instead;
+//  - duration and cleanersRequired come from the Properties tab and the scheduler
+//    fallback, not from Hostaway: never compared;
+//  - constraintStartTime/EndTime are not kept by the backend: restored silently (they are
+//    not in OPERATIONAL_FIELDS, so this never shows as an unpublished change);
+//  - note and displayName are never refreshed silently; the generated Hostaway note is
+//    rewritten only together with a timing change on a non-protected duty.
+// Only rows of the import week are merged; the caller deals with rows of other weeks.
+const HOSTAWAY_MERGE_GUEST_FIELDS = ['guestCount','guestAdults','guestChildren','guestInfants','guestPets','incomingGuestCount','incomingAdults','incomingChildren','incomingInfants','incomingPets'];
+const hostawayDutyKey = j => [j.dateISO, j.propertyId, j.type].join('|');
+const hostawayResId = j => (String(j.note||'').match(/\bRes (\d+)/) || [])[1] || '';
+const sameImportValue = (a, b) => { const n = v => (v===null || v===undefined || v==='') ? '' : String(v); return n(a) === n(b); };
+const isProtectedHostawayDuty = j => j.manualEdited === true || j.schedulerDecisionCode === 'manual_edit' || j.rescueUsed === true || j.schedulerDecisionCode === 'rescue_split';
+const hostawayTimingFields = nj => (nj.flexibleWindow === true ? ['serviceTypeId','flexibleWindow','windowStartTime','windowEndTime'] : ['serviceTypeId','startTime']).filter(f => f in nj);
+const sameHostawayData = (old, nj) =>
+  hostawayTimingFields(nj).every(f => sameImportValue(old[f], nj[f])) &&
+  HOSTAWAY_MERGE_GUEST_FIELDS.every(f => !(f in nj) || sameImportValue(old[f], nj[f]));
+const mergeHostawayImportJobs = (prevJobs, incoming, { inWeek, importSource, makeId }) => {
+  const report = { added:[], timing:[], keptManual:[], guests:[], missing:[], unchanged:0 };
+  const existing = (prevJobs||[]).filter(j => j.source === importSource && inWeek(j.dateISO));
+  const rows = (incoming||[]).filter(nj => inWeek(nj.dateISO));
+  const byKey = new Map();
+  existing.forEach(j => { const k = hostawayDutyKey(j); if(!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(j); });
+  const usedOld = new Set(), usedRow = new Set(), pairs = [];
+  const pairUp = (i, old) => { usedRow.add(i); usedOld.add(old); pairs.push({ nj:rows[i], old }); };
+  const free = i => !usedRow.has(i);
+  rows.forEach((nj, i) => { const old = (byKey.get(hostawayDutyKey(nj))||[]).find(o => !usedOld.has(o) && sameHostawayData(o, nj)); if(old) pairUp(i, old); });
+  rows.forEach((nj, i) => { if(!free(i)) return; const old = (byKey.get(hostawayDutyKey(nj))||[]).find(o => !usedOld.has(o)); if(old) pairUp(i, old); });
+  rows.forEach((nj, i) => {
+    if(!free(i)) return;
+    const res = hostawayResId(nj); if(!res) return;
+    const old = existing.find(o => !usedOld.has(o) && o.type === nj.type && hostawayResId(o) === res);
+    if(old) pairUp(i, old);
+  });
+  const updates = new Map();
+  pairs.forEach(({ nj, old }) => {
+    const isProtected = isProtectedHostawayDuty(old);
+    const next = { ...old };
+    let guestsChanged = false;
+    HOSTAWAY_MERGE_GUEST_FIELDS.forEach(f => {
+      if(f in nj && !sameImportValue(old[f], nj[f])){ next[f] = nj[f] ?? null; guestsChanged = true; }
+    });
+    ['constraintStartTime','constraintEndTime'].forEach(f => { if(f in nj) next[f] = nj[f]; else delete next[f]; });
+    const diffs = hostawayTimingFields(nj).filter(f => !sameImportValue(old[f], nj[f]));
+    if(diffs.length){
+      if(isProtected){
+        report.keptManual.push({ job:old, fields:diffs, incoming:nj });
+      } else {
+        diffs.forEach(f => { next[f] = nj[f]; });
+        if(nj.flexibleWindow === true){
+          const ws = t2m(nj.windowStartTime), we = t2m(nj.windowEndTime), st = t2m(String(next.startTime||nj.startTime));
+          const dur = Math.round((Number(next.duration)||0) * 60);
+          if(!(st >= ws && st + dur <= we)) next.startTime = nj.startTime;
+        }
+        if(/^Hostaway /.test(String(old.note||'')) && typeof nj.note === 'string') next.note = nj.note;
+        // calcJobStatus never returns "unassigned": keep that status on a duty nobody staffs yet.
+        next.status = ((next.cleanerIds||[]).length === 0 && old.status === 'unassigned') ? 'unassigned' : calcJobStatus(next);
+        report.timing.push({ job:next, before:old, fields:diffs });
+      }
+    }
+    if(guestsChanged) report.guests.push(next);
+    if(!diffs.length && !guestsChanged) report.unchanged++;
+    if(JSON.stringify(next) !== JSON.stringify(old)) updates.set(old.id, next);
+  });
+  rows.forEach((nj, i) => { if(free(i)) report.added.push({ ...nj, id:makeId(), source:importSource, status:'unassigned' }); });
+  const imported = [...pairs.map(p => p.nj), ...report.added];
+  existing.forEach(o => {
+    if(usedOld.has(o)) return;
+    const b2b = o.type === 'checkin' && imported.some(x => x.type === 'checkout' && x.dateISO === o.dateISO && x.propertyId === o.propertyId);
+    report.missing.push({ job:o, reason: b2b ? 'b2b' : 'gone' });
+  });
+  report.hasNews = (report.added.length + report.timing.length + report.keptManual.length + report.guests.length + report.missing.length) > 0;
+  return { jobs:[...(prevJobs||[]).map(j => updates.get(j.id) || j), ...report.added], report };
+};
+// ── END HOSTAWAY RE-IMPORT MERGE ──
+
 const formatDayMonth = (isoString) => {
   if(!isoString) return '—';
   const d = parseISODateLocal(isoString);
@@ -9903,6 +9995,52 @@ class ViewBoundary extends React.Component {
   }
 }
 
+// Result of a Hostaway re-import merged into the plan (see mergeHostawayImportJobs).
+function HostawayImportReport({report,onClose,onRemoveMissing,onOpenJob}){
+  const FIELD={serviceTypeId:'servizio',windowStartTime:'inizio',windowEndTime:'fine finestra',startTime:'orario',flexibleWindow:'finestra'};
+  const val=(f,v)=>f==='serviceTypeId'?getSupervisorServiceLabel(v,''):(v===true?'sì':v===false?'no':(v||'—'));
+  const label=j=>`${formatDayMonth(j.dateISO)} · ${getJobDisplayName(j)} · ${getSupervisorServiceLabel(j.serviceTypeId,j.type)} ${j.startTime||''}`;
+  const MAX=8;
+  const list=(items,detail)=>(
+    <div style={{display:'grid',gap:3,marginTop:4}}>
+      {items.slice(0,MAX).map((it,i)=>{ const j=it.job||it; return (
+        <button key={(j.id||'')+i} onClick={()=>onOpenJob(j)} style={{textAlign:'left',background:'rgba(255,255,255,0.65)',border:'1px solid #EADBB8',borderRadius:8,padding:'4px 8px',fontSize:12,cursor:'pointer',fontFamily:'inherit',color:'#3D2E00'}}>
+          {label(j)}{detail&&<span style={{color:'#8A6100'}}> · {detail(it)}</span>}
+        </button>
+      );})}
+      {items.length>MAX&&<div style={{fontSize:11,color:'#8A6100'}}>…e altri {items.length-MAX}</div>}
+    </div>
+  );
+  const sec=(icon,title,body)=>(<div style={{marginTop:10}}><div style={{fontSize:13,fontWeight:800}}>{icon} {title}</div>{body}</div>);
+  return(
+    <div role="status" style={{margin:'0 0 12px',background:'#FFF8E6',border:'1.5px solid #F0C36D',borderRadius:14,padding:'12px 14px',color:'#3D2E00'}}>
+      <div style={{display:'flex',alignItems:'center',gap:8}}>
+        <div style={{fontSize:14,fontWeight:800}}>Import {report.srcLabel}: aggiornamento della settimana</div>
+        <button onClick={onClose} aria-label="Chiudi" style={{marginLeft:'auto',border:'none',background:'transparent',fontSize:18,cursor:'pointer',color:'#8A6100'}}>×</button>
+      </div>
+      <div style={{fontSize:12,color:'#6B5200',marginTop:2}}>I turni già pianificati sono rimasti com'erano ({report.unchanged} invariati). Qui sotto solo ciò che Hostaway ha cambiato.</div>
+      {report.added.length>0&&sec('＋',`${report.added.length} ${report.added.length===1?'nuovo turno':'nuovi turni'} da assegnare`,list(report.added))}
+      {report.timing.length>0&&sec('⏰',`${report.timing.length} ${report.timing.length===1?'turno cambiato':'turni cambiati'}: persone mantenute, controlla`,list(report.timing,it=>it.fields.map(f=>`${FIELD[f]||f} ${val(f,it.before[f])} → ${val(f,it.job[f])}`).join(', ')))}
+      {report.keptManual.length>0&&sec('✋',`${report.keptManual.length} ${report.keptManual.length===1?'turno modificato':'turni modificati'} a mano: Hostaway ha cambiato qualcosa, la tua modifica è stata mantenuta`,list(report.keptManual,it=>'Hostaway: '+it.fields.map(f=>`${FIELD[f]||f} ${val(f,it.incoming[f])}`).join(', ')))}
+      {report.missing.length>0&&sec('⚠',`${report.missing.length} ${report.missing.length===1?'turno non è':'turni non sono'} più nell'import Hostaway`,(<>
+        <div style={{display:'grid',gap:3,marginTop:4}}>
+          {report.missing.slice(0,MAX).map(m=>(
+            <div key={m.job.id} style={{display:'flex',gap:6,alignItems:'stretch'}}>
+              <button onClick={()=>onOpenJob(m.job)} style={{flex:1,textAlign:'left',background:'rgba(255,255,255,0.65)',border:'1px solid #EADBB8',borderRadius:8,padding:'4px 8px',fontSize:12,cursor:'pointer',fontFamily:'inherit',color:'#3D2E00'}}>
+                {label(m.job)}<span style={{color:'#8A6100'}}> · {m.reason==='b2b'?'sostituito dal back-to-back dello stesso giorno':'prenotazione cancellata o spostata'}</span>
+              </button>
+              <button onClick={()=>onRemoveMissing([m.job.id])} style={{padding:'4px 10px',borderRadius:8,background:'white',color:'#A66A43',border:'1px solid #A66A43',fontWeight:800,fontSize:12,cursor:'pointer',fontFamily:'inherit'}}>Rimuovi</button>
+            </div>
+          ))}
+          {report.missing.length>MAX&&<div style={{fontSize:11,color:'#8A6100'}}>…e altri {report.missing.length-MAX}</div>}
+        </div>
+        {report.missing.length>1&&<button onClick={()=>onRemoveMissing(report.missing.map(m=>m.job.id))} style={{marginTop:6,padding:'6px 12px',borderRadius:9,background:'#A66A43',color:'white',border:'none',fontWeight:800,fontSize:12,cursor:'pointer',fontFamily:'inherit'}}>Rimuovi tutti i {report.missing.length}</button>}
+      </>))}
+      {report.guests.length>0&&sec('👥',`Ospiti aggiornati in ${report.guests.length} ${report.guests.length===1?'turno':'turni'}`,null)}
+    </div>
+  );
+}
+
 function Modal({children,onClose}){
   return(
     <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:300,display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
@@ -12935,6 +13073,8 @@ function App(){
   const [loggingIn,    setLoggingIn   ]=useState(false);
   const [authLost,     setAuthLost    ]=useState(null); // set when the server rejects the session mid-use
   const [authEpoch,    setAuthEpoch   ]=useState(0);    // bumped on every login: refetches the published week
+  const [hostawayReport, setHostawayReport]=useState(null); // result of a merged Hostaway re-import
+  useEffect(()=>{ setHostawayReport(null); },[weekOffset]);
   // Provisional (owner-set) password: must be replaced before using the app.
   const [mustChangePw, setMustChangePw]=useState(()=>!!(((getSession()||{}).user||{}).mustChangePassword));
   const provisionalPwRef=useRef(''); // the password just typed at login, in memory only
@@ -13847,6 +13987,42 @@ function App(){
       source: importSource,
       status:'unassigned'
     }));
+    const srcLabel = importSource==='hostaway_api' ? 'Hostaway API' : 'CSV';
+
+    // Re-import of a week that already has duties from this same source: merge into the
+    // plan instead of replacing it (people and manual changes survive). See
+    // mergeHostawayImportJobs. The first import and an API<->CSV switch replace, as before.
+    const sameInWeek = jobs.filter(j=>j.source===importSource && inWeek(j.dateISO));
+    if(otherInWeek.length===0 && sameInWeek.length>0){
+      const { jobs:merged, report } = mergeHostawayImportJobs(jobs, rows, { inWeek, importSource, makeId:uid });
+      // Rows of other weeks (a CSV can span weeks): same dedup as the replace path below.
+      const isHostawaySrc = j => j.source==='hostaway_api' || j.source==='hostaway_csv';
+      const otherWeekNew = incoming.filter(nj => !inWeek(nj.dateISO) && !merged.some(e => isHostawaySrc(e) && e.dateISO===nj.dateISO && e.propertyId===nj.propertyId && e.startTime===nj.startTime));
+      setJobs(otherWeekNew.length ? [...merged, ...otherWeekNew] : merged); // also carries silent refreshes (data the sheet does not keep)
+      if(planningWeekOffset===null) setPlanningWeekOffset(weekOffset);
+      setModal(null);
+      if(!report.hasNews){
+        setHostawayReport(null);
+        showToast('Nessun nuovo dato da importare: la settimana è già aggiornata');
+        return;
+      }
+      const planChanged = report.added.length>0 || report.timing.length>0;
+      setWf(w=>({
+        ...w,
+        hostawayLoaded:true,
+        hostawaySource:importSource,
+        staleGeneration:(planChanged && w.shiftsGenerated)?true:w.staleGeneration
+      }));
+      setHostawayReport({ ...report, srcLabel });
+      const parts = [
+        report.added.length && `${report.added.length} ${report.added.length===1?'nuovo':'nuovi'}`,
+        report.timing.length && `${report.timing.length} ${report.timing.length===1?'cambiato':'cambiati'}`,
+        (report.keptManual.length+report.missing.length) && `${report.keptManual.length+report.missing.length} da controllare`,
+        report.guests.length && `ospiti aggiornati in ${report.guests.length}`,
+      ].filter(Boolean);
+      showToast(`✓ Import ${srcLabel}: ${parts.join(' · ')}`);
+      return;
+    }
 
     const isSameJob = (a,b) =>
       a.dateISO===b.dateISO &&
@@ -13872,8 +14048,8 @@ function App(){
 
     if(planningWeekOffset===null) setPlanningWeekOffset(weekOffset);
     setModal(null);
+    setHostawayReport(null);
 
-    const srcLabel = importSource==='hostaway_api' ? 'Hostaway API' : 'CSV';
     showToast(`✓ ${incoming.length} turni importati da ${srcLabel}`);
   };
 
@@ -14463,6 +14639,14 @@ function App(){
           </div>
         </div>
       ) : (<>
+      {hostawayReport&&<ViewBoundary name="import Hostaway"><HostawayImportReport report={hostawayReport} onClose={()=>setHostawayReport(null)}
+        onRemoveMissing={ids=>{
+          if(!confirm(`Rimuovere ${ids.length===1?'il turno':ids.length+' turni'} che non ${ids.length===1?'è':'sono'} più in Hostaway?`)) return;
+          setJobs(p=>p.filter(j=>!ids.includes(j.id)));
+          setHostawayReport(r=>r?{...r,missing:r.missing.filter(m=>!ids.includes(m.job.id))}:r);
+          showToast(ids.length===1?'Turno rimosso':`${ids.length} turni rimossi`);
+        }}
+        onOpenJob={j=>{setSelDay(j.day);setHighlightJob(j.id);setTab('day');}}/></ViewBoundary>}
       {tab==='week'&&<ViewBoundary name="Settimana"><WeekView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDaySelect={d=>{setSelDay(d);setTab('day');}} onConflictDay={goToConflictDay} onLoadTemplate={()=>setModal('template')} onImportHostaway={()=>setModal('hostaway')} onGenerate={handleGenerate} wf={wf} dataReady={dataReady} genGate={genGate} trainingOk={trainingStatus.ok} trainingMissing={trainingStatus.propertiesWithoutTraining.length} trainingMissingJobs={trainingStatus.jobsWithoutTraining.length} onApplyFallback={applyFallbackReallocation}/></ViewBoundary>}
       {tab==='day'&&<ViewBoundary name="Giorno"><DayView jobs={visibleJobs} conflicts={visibleConflicts} day={selDay} setDay={d=>{setSelDay(d);setHighlightJob(null);}} weekOffset={weekOffset} onAdd={openAdd} onEdit={openEdit} onFix={fixConflict} onFindSolution={findSolution} highlightJobId={highlightJob} setHighlightJob={setHighlightJob} onLoadTemplate={()=>setModal('template')} onCleanerClick={openCleanerWeek}/></ViewBoundary>}
       {tab==='props'&&<ViewBoundary name="Proprietà"><PropertiesView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDayAndJobSelect={(day,jobId)=>{setSelDay(day);setHighlightJob(jobId);setTab('day');}}/></ViewBoundary>}
