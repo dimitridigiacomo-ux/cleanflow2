@@ -10041,6 +10041,501 @@ function HostawayImportReport({report,onClose,onRemoveMissing,onOpenJob}){
   );
 }
 
+// ── TABELLA (vista stile Excel, solo desktop) ──────────────────────────────────
+// Full-screen, spreadsheet-like editor of the week, laid out exactly like the Supervisor
+// XLSX export (same columns, cell text, row order and fills; see exportSupervisorScheduleXLSX).
+// Phase 1 edits: Start, End, Cleaners (people + per-person hours) and Notes. Every edit goes
+// through App.updateJobFromTable, i.e. the same rules as JobForm: times and people make the
+// duty "manual" (Rigenera leaves it alone); a note alone does not.
+const TABLE_COLS = [
+  { k:'start', label:'Start' }, { k:'end', label:'End' }, { k:'prop', label:'Property', ro:true },
+  { k:'service', label:'Service', ro:true }, { k:'guests', label:'Guests', ro:true },
+  { k:'cleaners', label:'Cleaners' }, { k:'notes', label:'Notes' },
+];
+// Cell colours use the shared taxonomy (isRealConflictIssue): real conflicts red, review-only yellow.
+// Display-only clock, as in the Supervisor export (a shift past midnight shows 01:00, not 25:00).
+const tableClock = minutes => { const n = ((Math.round(minutes) % 1440) + 1440) % 1440; return m2t(n); };
+const tableNormTime = v => {
+  const m = /^\s*(\d{1,2})(?:[:.,h ]?(\d{2}))?\s*$/.exec(String(v||''));
+  if(!m) return null;
+  const h = +m[1], mi = m[2] !== undefined ? +m[2] : 0;
+  return h < 24 && mi < 60 ? m2t(h*60 + mi) : null;
+};
+// Same order as the export: property DisplayOrder, start, name, id.
+const sortTableDayJobs = list => [...list].sort((a, b) => {
+  const oa = getPropertyDisplayOrder(a.propertyId), ob = getPropertyDisplayOrder(b.propertyId);
+  if(oa !== ob) return oa - ob;
+  const ta = getJobOperationalStartMinutes(a), tb = getJobOperationalStartMinutes(b);
+  if(ta !== tb) return ta - tb;
+  const na = getJobDisplayName(a), nb = getJobDisplayName(b);
+  if(na !== nb) return na.localeCompare(nb);
+  return String(a.id||'').localeCompare(String(b.id||''));
+});
+// Cell texts, built exactly like one row of the Supervisor export.
+const tableRowCells = (job, nameMap) => {
+  const validStart = isExportHHMM(job.startTime);
+  const rawNote = (job.note || '').trim();
+  return {
+    start: validStart ? tableClock(getJobOperationalStartMinutes(job)) : '',
+    end: validStart ? tableClock(getJobOperationalEndMinutes(job)) : '',
+    prop: getJobDisplayName(job),
+    service: getSupervisorServiceLabel(job.serviceTypeId, job.type),
+    guests: getSupervisorGuestCompact(getArrivalGuestDisplaySource(job)),
+    cleaners: buildSupervisorCleanersCell(job, dedupeCleanerIds(job.cleanerIds), nameMap, tableClock),
+    notes: (rawNote.startsWith('Hostaway checkout') || rawNote.startsWith('Hostaway check-in')) ? '' : rawNote,
+  };
+};
+const isManualJob = j => j.manualEdited === true || j.schedulerDecisionCode === 'manual_edit';
+
+function TableView({ jobs, conflicts, weekOffset, initialDay, publishLabel, publishBusy, onPublish, onPrint,
+                     onUpdateJob, onOpenCleaner, onClose, onMinimize, showToast }){
+  const dates = getWeekDates(weekOffset);
+  const [dayIdx, setDayIdx] = useState(() => Math.max(0, DAYS.indexOf(initialDay)));
+  const [sel, setSel] = useState({ r:0, c:0, r2:0, c2:0 });
+  const [editing, setEditingState] = useState(null); // { id, k, value }
+  const editRef = useRef(null); // mirrors editing so Enter + blur never commit twice
+  const setEditing = v => { editRef.current = typeof v === 'function' ? v(editRef.current) : v; setEditingState(editRef.current); };
+  // Undo batches, newest last. Each entry: { id, expect: fields the edit wrote, before: their old values }.
+  const [undoStack, setUndoStack] = useState([]);
+  const [widgets, setWidgets] = useState(() => { try { return { cleaner:false, day:false, hours:false, ...JSON.parse(localStorage.getItem('cf_table_widgets')||'{}') }; } catch(e){ return { cleaner:false, day:false, hours:false }; } });
+  const gridRef = useRef(null);
+  const day = DAYS[dayIdx];
+
+  const nameMap = useMemo(() => buildSupervisorCleanerNameMap(jobs), [jobs]);
+  const rows = useMemo(() => sortTableDayJobs(jobs.filter(j => j.day === day)), [jobs, day]);
+  const issuesOf = j => (conflicts && conflicts.get ? conflicts.get(j.id) : null) || [];
+
+  // Severity per cell: red = a real conflict (overlap, travel, late rest, availability, training,
+  // window), yellow = review only (missing people, gender/senior requirement, nobody assigned).
+  const cellIssue = (j, k) => {
+    const list = issuesOf(j);
+    if(k === 'cleaners'){
+      const red = list.find(x => isRealConflictIssue(x) && x.type !== 'window');
+      if(red) return { lvl:'bad', msg:red.msg };
+      if(dedupeCleanerIds(j.cleanerIds).length === 0) return { lvl:'warn', msg:'Turno da assegnare' };
+      const y = list.find(x => !isRealConflictIssue(x));
+      if(y) return { lvl:'warn', msg:y.msg };
+    }
+    if(k === 'start' || k === 'end'){
+      const w = list.find(x => x.type === 'window');
+      if(w) return { lvl:'bad', msg:w.msg };
+    }
+    return null;
+  };
+
+  const clampSel = (s, n) => {
+    const cl = v => Math.max(0, Math.min(v, Math.max(0, n - 1)));
+    const cc = v => Math.max(0, Math.min(v, TABLE_COLS.length - 1));
+    return { r:cl(s.r), c:cc(s.c), r2:cl(s.r2), c2:cc(s.c2) };
+  };
+  useEffect(() => { setSel(s => clampSel(s, rows.length)); }, [rows.length]);
+  useEffect(() => { try { localStorage.setItem('cf_table_widgets', JSON.stringify(widgets)); } catch(e){} }, [widgets]);
+  const focusGrid = () => { if(gridRef.current) gridRef.current.focus(); };
+  useEffect(() => { focusGrid(); }, []);
+  useEffect(() => { setUndoStack([]); }, [weekOffset]);
+
+  // ── applying an edit (validation mirrors JobForm) ──
+  const editText = (j, k) => {
+    const cells = tableRowCells(j, nameMap);
+    if(k === 'cleaners') return cells.cleaners.split('\n').join(' + ');
+    if(k === 'notes') return cells.notes;
+    return cells[k] || '';
+  };
+  const resolveCleaner = token => {
+    const t = token.trim().toLowerCase(); if(!t) return null;
+    const byLabel = Object.keys(nameMap).find(id => String(nameMap[id]).toLowerCase() === t);
+    if(byLabel) return CLEANERS.find(c => String(c.id) === String(byLabel)) || null;
+    const exact = CLEANERS.filter(c => String(c.name||'').trim().toLowerCase() === t);
+    if(exact.length === 1) return exact[0];
+    const pre = CLEANERS.filter(c => String(c.name||'').trim().toLowerCase().startsWith(t));
+    return pre.length === 1 ? pre[0] : null;
+  };
+  // Returns { patch, manual } or { error }.
+  const buildPatch = (j, k, raw) => {
+    const v = String(raw ?? '').trim();
+    const dutyS = getJobOperationalStartMinutes(j), dutyE = getJobOperationalEndMinutes(j);
+    const overridesFit = (startMin, endMin, overrides) => Object.keys(overrides || {}).every(id => {
+      const ov = overrides[id] || {};
+      const s = ov.startTime && isValidHHMM(ov.startTime) ? t2m(ov.startTime) : startMin;
+      const e = ov.endTime && isValidHHMM(ov.endTime) ? t2m(ov.endTime) : endMin;
+      return s >= startMin && e > s && e <= endMin;
+    });
+    if(k === 'notes'){
+      // The automatic Hostaway note (booking number, back-to-back window) is hidden here, as in
+      // the printout: replacing it needs an explicit yes.
+      if(v && /^Hostaway (checkout|check-in)/.test(String(j.note||'').trim()) &&
+         !window.confirm('Questo turno ha la nota automatica di Hostaway (numero di prenotazione, finestra del B2B), che nella tabella e nella stampa non si vede.\n\nSostituirla con la tua nota?')) return { cancel:true };
+      return { patch:{ note:v }, manual:false };
+    }
+    if(k === 'start'){
+      const t = tableNormTime(v); if(!t) return { error:`"${v}" non è un orario: scrivi per esempio 10:30` };
+      const next = { ...j, startTime:t };
+      if(j.manualEndTime && isValidHHMM(j.manualEndTime) && t2m(j.manualEndTime) <= t2m(t))
+        return { error:`La fine impostata (${j.manualEndTime}) è prima del nuovo inizio: cambia prima la fine` };
+      if(!overridesFit(t2m(t), getJobOperationalEndMinutes(next), j.cleanerTimeOverrides))
+        return { error:'Il nuovo orario esclude gli orari personali in Cleaners: cambia prima quelli' };
+      return { patch:{ startTime:t }, manual:true };
+    }
+    if(k === 'end'){
+      const t = tableNormTime(v); if(!t) return { error:`"${v}" non è un orario: scrivi per esempio 13:00` };
+      if(t2m(t) <= dutyS) return { error:'La fine deve essere dopo l\'inizio' };
+      const manualEndTime = t2m(t) === getJobDefaultEndMinutes(j) ? '' : t;
+      if(!overridesFit(dutyS, t2m(t), j.cleanerTimeOverrides))
+        return { error:'La nuova fine esclude gli orari personali in Cleaners: cambia prima quelli' };
+      return { patch:{ manualEndTime }, manual:true };
+    }
+    if(k === 'cleaners'){
+      const ids = [], overrides = {};
+      const tokens = v ? v.split(/\s*[+,;\n]\s*/).filter(Boolean) : [];
+      for(const tok of tokens){
+        const m = /^(.*?)\s+(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})$/.exec(tok.trim());
+        const name = m ? m[1] : tok;
+        const cl = resolveCleaner(name);
+        if(!cl) return { error:`Nel team non c'è nessuno (o c'è più di una persona) chiamato "${name.trim()}"` };
+        const id = String(cl.id);
+        if(ids.includes(id)) continue;
+        ids.push(id);
+        if(m){
+          const s = tableNormTime(m[2]), e = tableNormTime(m[3]);
+          if(!s || !e) return { error:`Orario di ${name.trim()} non valido` };
+          const wasHere = dedupeCleanerIds(j.cleanerIds).includes(id) && !(j.cleanerTimeOverrides || {})[id];
+          if(wasHere && s === tableClock(getCleanerOperationalStartMinutes(j, id)) && e === tableClock(getCleanerOperationalEndMinutes(j, id))) continue;
+          if(!(t2m(s) >= dutyS && t2m(e) > t2m(s) && t2m(e) <= dutyE))
+            return { error:`L'orario di ${name.trim()} deve stare dentro il turno (${tableClock(dutyS)}–${tableClock(dutyE)})` };
+          if(t2m(s) !== dutyS || t2m(e) !== dutyE) overrides[id] = { startTime:s, endTime:e };
+        }
+      }
+      return { patch:{ cleanerIds:ids, cleanerTimeOverrides:overrides }, manual:true };
+    }
+    return { error:'Questa colonna non si modifica dalla tabella' };
+  };
+  // Field comparison that treats empty values alike (undefined, null, '', {}).
+  const normField = v => {
+    if(v === undefined || v === null || v === '') return '';
+    if(typeof v === 'object' && !Array.isArray(v)) return Object.keys(v).length ? JSON.stringify(Object.keys(v).sort().reduce((o, key) => (o[key] = v[key], o), {})) : '';
+    return typeof v === 'object' ? JSON.stringify(v) : String(v);
+  };
+  const UNDO_EXTRA = ['earlyLeaveSuggestions']; // may be dropped by the edit (overridden person)
+  const makeEntry = (j, patch, manual) => {
+    const expect = { ...patch, ...(manual ? { manualEdited:true, schedulerDecisionCode:'manual_edit' } : {}) };
+    if(expect.cleanerIds) expect.cleanerIds = dedupeCleanerIds(expect.cleanerIds);
+    const before = {};
+    [...Object.keys(expect), ...UNDO_EXTRA].forEach(f => { before[f] = j[f] === undefined ? null : j[f]; });
+    return { id:j.id, expect, before };
+  };
+  const pushUndo = entries => { const list = entries.filter(Boolean); if(list.length) setUndoStack(st => [...st.slice(-99), list]); };
+  // Returns an undo entry, null when nothing changed (or the user cancelled), false on error.
+  const applyEdit = (j, k, raw) => {
+    if(String(raw ?? '').trim() === editText(j, k).trim()) return null;
+    const res = buildPatch(j, k, raw);
+    if(res.cancel) return null;
+    if(res.error){ showToast(res.error, 'error'); return false; }
+    if(Object.keys(res.patch).every(f => normField(j[f]) === normField(res.patch[f]))) return null; // same value retyped
+    const entry = makeEntry(j, res.patch, res.manual);
+    return onUpdateJob(j.id, res.patch, { manual:res.manual }) ? entry : null;
+  };
+  // Undo only restores the fields the table changed, and only if they still hold what the
+  // table wrote: a later change made elsewhere (JobForm, Hostaway, another device) is kept.
+  const undo = () => {
+    if(!undoStack.length) return;
+    const batch = undoStack[undoStack.length - 1];
+    setUndoStack(st => st.slice(0, -1));
+    let skipped = 0;
+    [...batch].reverse().forEach(en => {
+      const cur = jobs.find(x => x.id === en.id);
+      if(!cur || !Object.keys(en.expect).every(f => normField(cur[f]) === normField(en.expect[f]))){ skipped++; return; }
+      onUpdateJob(en.id, en.before, { manual:false });
+    });
+    if(skipped) showToast(skipped === batch.length ? 'Non posso annullare: nel frattempo il turno è stato cambiato da un\'altra parte' : `Annullato in parte: ${skipped} turni erano già stati cambiati da un'altra parte`, 'warn');
+  };
+
+  // ── selection & keyboard ──
+  const select = (r, c, extend) => {
+    setSel(s => clampSel(extend ? { ...s, r2:r, c2:c } : { r, c, r2:r, c2:c }, rows.length));
+  };
+  const move = (dr, dc, extend) => {
+    let r = sel.r2 + dr, c = sel.c2 + dc;
+    if(c > TABLE_COLS.length - 1){ c = 0; r++; } if(c < 0){ c = TABLE_COLS.length - 1; r--; }
+    select(Math.max(0, Math.min(r, rows.length - 1)), c, extend);
+  };
+  const startEdit = initial => {
+    const j = rows[sel.r2]; if(!j) return;
+    const col = TABLE_COLS[sel.c2];
+    if(col.ro){ showToast(col.k === 'guests' ? 'Gli ospiti arrivano da Hostaway' : `${col.label} non si modifica dalla tabella (usa la finestra del turno)`, 'warn'); return; }
+    setSel(s => ({ ...s, r:s.r2, c:s.c2 }));
+    setEditing({ id:j.id, k:col.k, value: initial !== undefined ? initial : editText(j, col.k) });
+  };
+  // Returns false when the value is invalid (the editor stays open), true otherwise.
+  const commitEdit = (dr, dc) => {
+    const ed = editRef.current;
+    if(!ed) return true;
+    const j = rows.find(x => x.id === ed.id);
+    const res = j ? applyEdit(j, ed.k, ed.value) : null;
+    if(res === false) return false;
+    pushUndo([res]);
+    setEditing(null);
+    setTimeout(() => { focusGrid(); if(dr || dc) move(dr, dc, false); }, 0);
+    return true;
+  };
+  const clearSelection = () => {
+    const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
+    let blocked = false; const entries = [];
+    for(let r = r1; r <= r2; r++) for(let c = c1; c <= c2; c++){
+      const j = rows[r], k = TABLE_COLS[c].k; if(!j) continue;
+      if(k === 'notes' || k === 'cleaners') entries.push(applyEdit(j, k, '')); else blocked = true;
+    }
+    pushUndo(entries);
+    if(blocked) showToast('Si possono svuotare solo Cleaners e Notes', 'warn');
+  };
+  const unlockSelection = () => {
+    const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2);
+    const picked = rows.slice(r1, r2 + 1).filter(isManualJob);
+    if(!picked.length){ showToast('Seleziona una riga con la M per sbloccarla', 'warn'); return; }
+    const patch = { manualEdited:false, schedulerDecisionCode:'' };
+    pushUndo(picked.map(j => { const en = makeEntry(j, patch, false); return onUpdateJob(j.id, patch, { manual:false }) ? en : null; }));
+    const locked = picked.filter(isLockedTemplateJob).length;
+    showToast((picked.length === 1 ? 'Turno sbloccato: Rigenera potrà ricalcolarlo' : `${picked.length} turni sbloccati: Rigenera potrà ricalcolarli`)
+      + (locked ? ` (${locked === 1 ? 'uno è' : locked + ' sono'} da template: ${locked === 1 ? 'resta protetto' : 'restano protetti'})` : ''));
+  };
+  const selectionTSV = () => {
+    const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
+    const out = [];
+    for(let r = r1; r <= r2; r++){ const j = rows[r]; if(!j) continue; const line = []; for(let c = c1; c <= c2; c++) line.push(editText(j, TABLE_COLS[c].k)); out.push(line.join('\t')); }
+    return out.join('\n');
+  };
+  const onGridKey = e => {
+    if(editing) return;
+    const mod = e.ctrlKey || e.metaKey;
+    if(mod && e.key.toLowerCase() === 'z'){ e.preventDefault(); undo(); return; }
+    if(mod) return;
+    switch(e.key){
+      case 'ArrowDown': e.preventDefault(); move(1, 0, e.shiftKey); return;
+      case 'ArrowUp': e.preventDefault(); move(-1, 0, e.shiftKey); return;
+      case 'ArrowRight': e.preventDefault(); move(0, 1, e.shiftKey); return;
+      case 'ArrowLeft': e.preventDefault(); move(0, -1, e.shiftKey); return;
+      case 'Tab': e.preventDefault(); move(0, e.shiftKey ? -1 : 1, false); return;
+      case 'Enter': e.preventDefault(); move(e.shiftKey ? -1 : 1, 0, false); return;
+      case 'F2': e.preventDefault(); startEdit(); return;
+      case 'Delete': case 'Backspace': e.preventDefault(); clearSelection(); return;
+      case 'Escape': return;
+    }
+    if(e.key.length === 1 && !e.altKey){ e.preventDefault(); startEdit(e.key); }
+  };
+  const onCopy = e => {
+    if(editing) return;
+    e.clipboardData.setData('text/plain', selectionTSV()); e.preventDefault();
+    showToast('Copiato: si può incollare anche in Excel');
+  };
+
+  // ── numbers ──
+  const dayStats = list => {
+    const unassigned = list.filter(j => dedupeCleanerIds(j.cleanerIds).length === 0).length;
+    const review = list.filter(j => dedupeCleanerIds(j.cleanerIds).length > 0 && calcJobStatus(j) === 'needs_review').length;
+    const hours = list.reduce((s, j) => s + dedupeCleanerIds(j.cleanerIds).reduce((t, id) => t + getCleanerEffectiveJobDuration(j, id), 0), 0);
+    return { unassigned, review, hours:Math.round(hours * 10) / 10 };
+  };
+  const team = useMemo(() => {
+    const per = {}; const perDay = DAYS.map(() => ({ shifts:0, unassigned:0, people:new Set(), hours:0 }));
+    jobs.forEach(j => {
+      const di = DAYS.indexOf(j.day); if(di < 0) return;
+      const ids = dedupeCleanerIds(j.cleanerIds);
+      perDay[di].shifts++; if(!ids.length) perDay[di].unassigned++;
+      ids.forEach(id => {
+        const h = getCleanerEffectiveJobDuration(j, id);
+        const p = per[id] || (per[id] = { shifts:Array(7).fill(0), hours:0, days:new Set() });
+        p.shifts[di]++; p.hours += h; p.days.add(di);
+        perDay[di].people.add(id); perDay[di].hours += h;
+      });
+    });
+    return { per, perDay };
+  }, [jobs]);
+  const cleanerName = id => { const c = CLEANERS.find(x => String(x.id) === String(id)); return nameMap[id] || (c ? c.name : id); };
+  const redCount = list => getRealConflictCount(list, conflicts);
+
+  // ── render ──
+  const st = dayStats(rows);
+  const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
+  const date = dates[dayIdx];
+  const dayLabel = date ? `${DAY_EN[day]} ${date.getDate()} ${SUPERVISOR_MONTH_NAMES[date.getMonth()]} ${date.getFullYear()}` : DAY_EN[day];
+  const nWidgets = (widgets.cleaner?1:0) + (widgets.day?1:0) + (widgets.hours?1:0);
+  const sideW = nWidgets >= 2 ? 380 : 330;
+  const FONT = "Calibri, Carlito, 'Segoe UI', Arial, sans-serif";
+  const td = { border:'1px solid #D4D4D4', padding:'0 6px', height: nWidgets ? 23 : 26, whiteSpace:'nowrap', position:'relative', fontSize: nWidgets ? 12 : 13 };
+  const tb = { display:'inline-flex', alignItems:'center', gap:6, border:'1px solid #E3DCD3', background:'white', color:'#1B1916', borderRadius:9, padding:'6px 11px', fontSize:13, fontWeight:700, cursor:'pointer', fontFamily:'inherit', whiteSpace:'nowrap' };
+  const tbOn = { ...tb, background:'#F3E6DB', borderColor:'#A66A43' };
+  const box = { background:'white', border:'1px solid #E3DCD3', borderRadius:12, padding:'12px 14px' };
+  const h2 = { fontFamily:"'Syne',sans-serif", fontSize:14, fontWeight:800, margin:'0 0 8px' };
+  const mini = { width:'100%', borderCollapse:'collapse', fontSize:12.5, fontVariantNumeric:'tabular-nums' };
+  const toggle = k => setWidgets(w => ({ ...w, [k]:!w[k] }));
+
+  const dayIssues = [];
+  rows.forEach((j, r) => TABLE_COLS.forEach((c, ci) => { const is = cellIssue(j, c.k); if(is) dayIssues.push({ j, r, ci, ...is }); }));
+  dayIssues.sort((a, b) => (a.lvl === 'bad' ? 0 : 1) - (b.lvl === 'bad' ? 0 : 1));
+
+  return (
+    <div style={{position:'fixed',inset:0,zIndex:200,background:'#F5F2EE',display:'flex',flexDirection:'column',fontFamily:"'Nunito',sans-serif",color:'#1B1916'}}>
+      <div style={{background:'#0E0D0C',color:'#F7F3EC',padding:'10px 16px',display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+        <button onClick={onClose} style={{...tb,background:'transparent',color:'#F7F3EC',borderColor:'rgba(255,255,255,0.25)'}} title="Chiude la tabella e torna alla vista di prima">← Indietro</button>
+        <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:18}}>Tabella</div>
+        <div style={{fontSize:13,fontWeight:800,background:'rgba(255,255,255,0.08)',border:'1px solid rgba(255,255,255,0.14)',borderRadius:8,padding:'3px 10px'}}>{fmtWeek(weekOffset)}</div>
+        <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+          <span style={{fontSize:12.5,fontWeight:700,color:'#CFC6BC'}}>{publishLabel}</span>
+          <button onClick={onPrint} style={{...tb,background:'transparent',color:'#F7F3EC',borderColor:'rgba(255,255,255,0.25)'}} title="Scarica l'XLSX di sempre: 7 fogli, uno per giorno">🖨 Stampa settimana</button>
+          <button onClick={onPublish} disabled={publishBusy} style={{...tb,background:'#A66A43',color:'white',borderColor:'#A66A43',opacity:publishBusy?0.6:1}}>{publishBusy?'Pubblico…':'📤 Pubblica'}</button>
+          <button onClick={onMinimize} title="Riduci: la tabella resta com'è, la riapri dal pulsante in basso" style={{...tb,background:'transparent',color:'#F7F3EC',borderColor:'rgba(255,255,255,0.25)',padding:'6px 12px',fontSize:16,lineHeight:1}}>–</button>
+        </div>
+      </div>
+
+      <div style={{padding:'10px 16px',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+        <button style={{...tb,opacity:undoStack.length?1:0.45}} disabled={!undoStack.length} onClick={undo} title="Annulla l'ultima modifica (Ctrl+Z)">↶ Annulla</button>
+        <button style={tb} onClick={unlockSelection} title="Toglie la M: Rigenera potrà di nuovo ricalcolare il turno">🔓 Sblocca</button>
+        <span style={{width:1,height:22,background:'#E3DCD3',margin:'0 4px'}}/>
+        <span style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'#6E655C'}}>Riepiloghi</span>
+        <button style={widgets.cleaner?tbOn:tb} onClick={()=>toggle('cleaner')}>👥 Turni per cleaner</button>
+        <button style={widgets.day?tbOn:tb} onClick={()=>toggle('day')}>📅 Turni per giorno</button>
+        <button style={widgets.hours?tbOn:tb} onClick={()=>toggle('hours')}>⏱ Ore totali</button>
+        <span style={{marginLeft:'auto',fontSize:12,color:'#6E655C'}}>Scrivi per modificare · F2 o doppio clic · Invio/Tab · Esc · Canc · Ctrl+C · Ctrl+Z</span>
+      </div>
+
+      <div style={{flex:1,minHeight:0,display:'grid',gridTemplateColumns:`minmax(0,1fr) ${sideW}px`,gridTemplateRows:'minmax(0,1fr)',gap:14,padding:'0 16px 14px'}}>
+        <div style={{minWidth:0,display:'flex',flexDirection:'column',minHeight:0,height:'100%'}}>
+          <div ref={gridRef} tabIndex={0} onKeyDown={onGridKey} onCopy={onCopy} style={{flex:1,minHeight:0,overflow:'auto',background:'white',border:'1px solid #E3DCD3',borderRadius:'12px 12px 0 0',outline:'none'}}>
+            <table style={{borderCollapse:'collapse',fontFamily:FONT,color:'#1D1D1D',minWidth:'100%',fontVariantNumeric:'tabular-nums',userSelect:'none'}}>
+              <colgroup><col style={{width:46}}/><col style={{width:62}}/><col style={{width:62}}/><col style={{width:200}}/><col style={{width:100}}/><col style={{width:104}}/><col style={{width:240}}/><col style={{minWidth:180}}/></colgroup>
+              <tbody>
+                <tr><td style={{...td,background:'#F2F2F2'}}/>{TABLE_COLS.map((c,i)=><td key={i} style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11,height:20}}>{'ABCDEFG'[i]}</td>)}</tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>1</td><td colSpan={7} style={{...td,border:'none',fontSize:16,fontWeight:700,height:30}}>CleanFlow Supervisor Schedule</td></tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>2</td><td colSpan={7} style={{...td,border:'none',fontWeight:700}}>{dayLabel}</td></tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>3</td><td colSpan={7} style={{...td,border:'none',borderBottom:'1px solid #D4D4D4',color:'#444',whiteSpace:'pre'}}>{`Jobs: ${rows.length}    Unassigned: ${st.unassigned}    Needs review: ${st.review}    Total hours: ${st.hours}`}</td></tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>4</td>{TABLE_COLS.map(c=><td key={c.k} style={{...td,fontWeight:700}}>{c.label}</td>)}</tr>
+                {rows.map((j, r) => {
+                  const cells = tableRowCells(j, nameMap);
+                  const fillHex = getSupervisorJobFillColor(j);
+                  const fill = fillHex ? '#' + fillHex : 'white';
+                  const rowSel = r >= r1 && r <= r2;
+                  const mk = isManualJob(j) ? { t:'M', bg:'#2F6FDE', tip:'Orari o persone cambiati a mano: Rigenera non lo tocca. Seleziona la riga e premi Sblocca per ridarlo a Rigenera' }
+                    : isLockedTemplateJob(j) ? { t:'T', bg:'#7A5233', tip:'Da template: Rigenera non lo tocca' } : null;
+                  return (
+                    <tr key={j.id}>
+                      <td onMouseDown={e=>{e.preventDefault(); if(!commitEdit(0,0)) return; select(r, 0, false); setSel({ r, c:0, r2:r, c2:TABLE_COLS.length-1 }); focusGrid();}}
+                        style={{...td,background:rowSel?'#DCE6F8':'#F2F2F2',color:rowSel?'#2F6FDE':'#7A7A7A',textAlign:'center',fontSize:11,cursor:'pointer'}}>
+                        {r + 5}{mk&&<span title={mk.tip} style={{marginLeft:3,background:mk.bg,color:'white',borderRadius:3,padding:'0 3px',fontSize:9,fontWeight:800}}>{mk.t}</span>}
+                      </td>
+                      {TABLE_COLS.map((c, ci) => {
+                        const is = cellIssue(j, c.k);
+                        const isCur = r === sel.r2 && ci === sel.c2;
+                        const inSel = rowSel && ci >= c1 && ci <= c2;
+                        const isEd = editing && editing.id === j.id && editing.k === c.k;
+                        const txt = cells[c.k];
+                        const empty = c.k === 'cleaners' && !txt;
+                        let shadow = is ? (is.lvl === 'bad' ? 'inset 0 0 0 2px #C8323C' : 'inset 0 0 0 2px #E29A00') : 'none';
+                        if(isCur) shadow = 'inset 0 0 0 2px #2F6FDE';
+                        const bg = is ? (is.lvl === 'bad' ? '#F8C9CD' : '#FFE2A8') : fill;
+                        return (
+                          <td key={c.k} title={is ? is.msg : (c.ro ? (c.k==='guests'?'Da Hostaway':'Non modificabile dalla tabella') : '')}
+                            onMouseDown={e=>{ if(isEd) return; e.preventDefault(); if(!commitEdit(0,0)) return; select(r, ci, e.shiftKey); focusGrid(); }}
+                            onDoubleClick={()=>{ select(r, ci, false); setTimeout(()=>startEdit(),0); }}
+                            style={{...td,background:bg,backgroundImage:inSel?'linear-gradient(rgba(47,111,222,.13),rgba(47,111,222,.13))':'none',boxShadow:shadow,
+                              color: c.ro ? '#555' : (empty ? '#9A6B00' : '#1D1D1D'), fontStyle: empty ? 'italic' : 'normal',
+                              whiteSpace: String(txt).includes('\n') ? 'pre' : 'nowrap', lineHeight: String(txt).includes('\n') ? 1.25 : 'normal', cursor:'cell'}}>
+                            {isEd ? (
+                              <input autoFocus value={editing.value} onChange={e=>setEditing(ed=>({...ed,value:e.target.value}))}
+                                onKeyDown={e=>{ if(e.key==='Enter'){e.preventDefault();commitEdit(e.shiftKey?-1:1,0);} else if(e.key==='Tab'){e.preventDefault();commitEdit(0,e.shiftKey?-1:1);} else if(e.key==='Escape'){e.preventDefault();setEditing(null);setTimeout(focusGrid,0);} }}
+                                onBlur={()=>commitEdit(0,0)}
+                                list={c.k==='cleaners'?'cf-table-cleaners':undefined}
+                                style={{position:'absolute',inset:0,width:'100%',minWidth:140,height:'100%',border:'2px solid #2F6FDE',font:'inherit',padding:'0 5px',background:'white',color:'#1D1D1D',outline:'none',zIndex:2}}/>
+                            ) : (empty ? 'da assegnare' : txt)}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <datalist id="cf-table-cleaners">{CLEANERS.map(c=><option key={c.id} value={nameMap[c.id]||c.name}/>)}</datalist>
+          </div>
+          <div style={{display:'flex',gap:2,overflowX:'auto',background:'#F2F2F2',border:'1px solid #E3DCD3',borderTop:0,borderRadius:'0 0 12px 12px',padding:'0 6px 6px'}}>
+            {DAYS.map((d, i) => {
+              const list = jobs.filter(j => j.day === d); const bad = redCount(list);
+              const on = i === dayIdx;
+              return (
+                <button key={d} onClick={()=>{ if(!commitEdit(0,0)) return; setDayIdx(i); setSel({r:0,c:0,r2:0,c2:0}); setTimeout(focusGrid,0); }}
+                  style={{font:`600 12px ${FONT}`,border:'1px solid #D4D4D4',borderTop:0,background:on?'white':'#E9E9E9',color:on?'#1D6B3A':'#444',fontWeight:on?700:600,padding:'6px 14px',borderRadius:'0 0 6px 6px',cursor:'pointer',display:'flex',gap:6,alignItems:'center',boxShadow:on?'inset 0 -3px 0 #21A366':'none',whiteSpace:'nowrap'}}>
+                  {DAY_EN[d]}<span style={{color:'#888',fontWeight:400}}>{list.length}</span>
+                  {bad>0&&<span style={{minWidth:16,height:16,borderRadius:8,background:'#C8323C',color:'white',fontSize:10,lineHeight:'16px',padding:'0 4px',fontWeight:700}}>{bad}</span>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{minHeight:0,height:'100%',overflow:'auto',display:'grid',gap:12,alignContent:'start'}}>
+          {widgets.cleaner&&<div style={box}>
+            <div style={{display:'flex'}}><div style={h2}>Turni per cleaner</div><button onClick={()=>toggle('cleaner')} style={{marginLeft:'auto',border:'none',background:'none',cursor:'pointer',color:'#6E655C',fontSize:16}}>×</button></div>
+            <div style={{fontSize:11.5,color:'#6E655C',margin:'-4px 0 6px'}}>Clic su un nome per la sua settimana</div>
+            <table style={mini}><thead><tr><th style={{textAlign:'left',fontSize:10.5,color:'#6E655C'}}>Cleaner</th>{DAYS.map((d,i)=><th key={d} style={{fontSize:10.5,color:'#6E655C',background:i===dayIdx?'#E3ECFB':'none'}}>{DAY_IT[d].charAt(0)}</th>)}<th style={{fontSize:10.5,color:'#6E655C'}}>Turni</th><th style={{fontSize:10.5,color:'#6E655C'}}>Gg</th></tr></thead>
+              <tbody>{Object.keys(team.per).sort((a,b)=>team.per[b].shifts.reduce((s,x)=>s+x,0)-team.per[a].shifts.reduce((s,x)=>s+x,0)).map(id=>{
+                const p = team.per[id]; const cl = CLEANERS.find(x=>String(x.id)===String(id)); const max = cl ? getEffectiveMaxWorkedDays(cl) : 7;
+                return (<tr key={id} onClick={()=>onOpenCleaner(id)} style={{cursor:'pointer',borderBottom:'1px solid #EEE'}}>
+                  <td style={{padding:'3px 2px'}}>{cleanerName(id)}</td>
+                  {p.shifts.map((n,i)=><td key={i} style={{textAlign:'center',color:n?'#1B1916':'#CCC',background:i===dayIdx?'#E3ECFB':'none'}}>{n||'·'}</td>)}
+                  <td style={{textAlign:'center',fontWeight:800}}>{p.shifts.reduce((s,x)=>s+x,0)}</td>
+                  <td style={{textAlign:'center',fontWeight:p.days.size>max?800:400,color:p.days.size>max?'#A35F00':'#1B1916'}} title={p.days.size>max?`Oltre il limite di ${max} giorni`:''}>{p.days.size}</td>
+                </tr>);})}</tbody></table>
+          </div>}
+          {widgets.day&&<div style={box}>
+            <div style={{display:'flex'}}><div style={h2}>Turni per giorno</div><button onClick={()=>toggle('day')} style={{marginLeft:'auto',border:'none',background:'none',cursor:'pointer',color:'#6E655C',fontSize:16}}>×</button></div>
+            <table style={mini}><thead><tr>{['Giorno','Turni','Da ass.','Persone','Ore'].map(h=><th key={h} style={{fontSize:10.5,color:'#6E655C',textAlign:h==='Giorno'||h==='Ore'?'left':'center'}}>{h}</th>)}</tr></thead>
+              <tbody>{team.perDay.map((d,i)=>{ const maxH = Math.max(1,...team.perDay.map(x=>x.hours)); return (
+                <tr key={i} onClick={()=>{setDayIdx(i);setSel({r:0,c:0,r2:0,c2:0});}} style={{cursor:'pointer',background:i===dayIdx?'#F3E6DB':'none',borderBottom:'1px solid #EEE'}}>
+                  <td style={{padding:'3px 2px'}}>{DAY_IT[DAYS[i]]} {dates[i]?dates[i].getDate():''}</td><td style={{textAlign:'center'}}>{d.shifts}</td>
+                  <td style={{textAlign:'center',color:d.unassigned?'#A35F00':'#CCC',fontWeight:d.unassigned?800:400}}>{d.unassigned||'·'}</td><td style={{textAlign:'center'}}>{d.people.size}</td>
+                  <td style={{whiteSpace:'nowrap'}}><span style={{display:'inline-block',height:8,width:Math.round(d.hours/maxH*56),background:'#C9A184',borderRadius:4,marginRight:4}}/>{Math.round(d.hours*10)/10}</td>
+                </tr>);})}</tbody></table>
+          </div>}
+          {widgets.hours&&<div style={box}>
+            <div style={{display:'flex'}}><div style={h2}>Ore totali</div><button onClick={()=>toggle('hours')} style={{marginLeft:'auto',border:'none',background:'none',cursor:'pointer',color:'#6E655C',fontSize:16}}>×</button></div>
+            <div style={{display:'grid',gap:4}}>{(()=>{ const ids = Object.keys(team.per).sort((a,b)=>team.per[b].hours-team.per[a].hours); const max = Math.max(1,...ids.map(id=>team.per[id].hours));
+              return ids.map(id=>(<div key={id} onClick={()=>onOpenCleaner(id)} style={{display:'grid',gridTemplateColumns:'80px 1fr 70px',gap:8,alignItems:'center',fontSize:12.5,cursor:'pointer'}}>
+                <span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{cleanerName(id)}</span>
+                <span style={{height:10,background:'#F2EEE9',borderRadius:5,overflow:'hidden'}}><span style={{display:'block',height:'100%',width:`${(team.per[id].hours/max*100).toFixed(1)}%`,background:'#C9A184',borderRadius:5}}/></span>
+                <span style={{textAlign:'right',fontWeight:700}}>{Math.round(team.per[id].hours*10)/10} h <span style={{color:'#6E655C',fontWeight:600}}>{team.per[id].days.size} gg</span></span>
+              </div>)); })()}</div>
+          </div>}
+          <div style={box}>
+            <div style={h2}>Da controllare · {DAY_IT[day]}</div>
+            {dayIssues.length ? <div style={{display:'grid',gap:5,maxHeight:300,overflow:'auto'}}>{dayIssues.map((x,i)=>(
+              <button key={i} onClick={()=>{select(x.r,x.ci,false);focusGrid();}} style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:8,textAlign:'left',background:'#F8F5F1',border:'1px solid transparent',borderRadius:8,padding:'6px 8px',cursor:'pointer',fontFamily:'inherit',fontSize:12.5,color:'#1B1916'}}>
+                <span style={{marginTop:4,width:8,height:8,borderRadius:'50%',background:x.lvl==='bad'?'#C8323C':'#E29A00'}}/>
+                <span><b>{getJobDisplayName(x.j)}</b> {tableRowCells(x.j,nameMap).start}<span style={{display:'block',color:'#6E655C',fontSize:11.5}}>{x.msg}</span></span>
+              </button>))}</div> : <div style={{color:'#2E7D4F',fontWeight:800,fontSize:13}}>✓ {DAY_EN[day]}: tutto a posto</div>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// One person's week as plain text, in the order shifts are typed into When I Work
+// (one line per day; per-person hours when they differ from the shift).
+const buildCleanerWeekText = (cleanerId, jobs, weekOffset) => {
+  const id = String(cleanerId);
+  const cl = CLEANERS.find(c => String(c.id) === id);
+  const dates = getWeekDates(weekOffset);
+  const lines = [`${cl ? cl.name : id} · settimana ${fmtWeek(weekOffset)}`];
+  DAYS.forEach((d, i) => {
+    const mine = (jobs||[]).filter(j => j.day === d && dedupeCleanerIds(j.cleanerIds).includes(id))
+      .sort((a, b) => getCleanerOperationalStartMinutes(a, id) - getCleanerOperationalStartMinutes(b, id));
+    const date = dates[i] ? `${String(dates[i].getDate()).padStart(2,'0')}/${String(dates[i].getMonth()+1).padStart(2,'0')}` : '';
+    lines.push(`${DAY_IT[d]} ${date}: ` + (mine.length
+      ? mine.map(j => `${tableClock(getCleanerOperationalStartMinutes(j, id))}-${tableClock(getCleanerOperationalEndMinutes(j, id))} ${getJobDisplayName(j)} (${getSupervisorServiceLabel(j.serviceTypeId, j.type)})`).join('; ')
+      : 'libera'));
+  });
+  return lines.join('\n');
+};
+// (copyTextToClipboard: the app already has one, reused here.)
+
 function Modal({children,onClose}){
   return(
     <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:300,display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
@@ -11987,7 +12482,7 @@ function WIWExportModal({jobs,weekOffset,wf,conflicts,showToast,planningWeekOffs
 
 // ── DESKTOP SIDEBAR ────────────────────────────────────────────────────────────
 function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conflicts,onGenerate,onConflictDay,setModal,dataReady,genGate,refreshSheetData,sheetLoading,onLastMinute,supervisorName,onChangeSupervisorName,onPublish,publishing,publishedStatus,weekMismatchActive,showToast}){
-  const NAV=[{id:'week',icon:'📅',label:'Settimana'},{id:'day',icon:'📋',label:'Giorno'},{id:'props',icon:'🏢',label:'Proprietà'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI Chat'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(canSeeDebug()?[{id:'debug',icon:'🧪',label:'Debug Center'}]:[])];
+  const NAV=[{id:'week',icon:'📅',label:'Settimana'},{id:'day',icon:'📋',label:'Giorno'},{id:'props',icon:'🏢',label:'Proprietà'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI Chat'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},{id:'table',icon:'📊',label:'Tabella'},...(canSeeDebug()?[{id:'debug',icon:'🧪',label:'Debug Center'}]:[])];
   const unassigned=jobs.filter(j=>j.cleanerIds.length===0).length;
   // Same real-conflict taxonomy as WeekView (staffing/gender excluded) — shared
   // helpers defined near detectConflicts() so the two never drift apart.
@@ -13168,6 +13663,13 @@ function App(){
   useEffect(()=>{ planningWeekOffsetRef.current=planningWeekOffset; },[planningWeekOffset]);
   const width=useWindowWidth();
   const isDesktop=width>=DESKTOP_BP;
+  // Tabella (desktop only). It stays mounted while minimised, so day, selection and undo survive.
+  const [tableMounted,setTableMounted]=useState(false);
+  const tableBackTabRef=useRef('week');
+  useEffect(()=>{
+    if(tab==='table'){ if(!isDesktop){ setTab(tableBackTabRef.current||'week'); return; } setTableMounted(true); }
+    else tableBackTabRef.current=tab;
+  },[tab,isDesktop]);
 
   // ── Load Google Sheet data — only after login ────────────────────────────
   useEffect(()=>{
@@ -14508,6 +15010,26 @@ function App(){
     if(filtered.length === job.earlyLeaveSuggestions.length) return job;
     return {...job, earlyLeaveSuggestions: filtered.length ? filtered : null};
   };
+  // Edits from the Tabella. Same rules as saveJob: times/people make the duty manual (so
+  // Rigenera leaves it alone); a note alone does not (manual:false).
+  const updateJobFromTable=(id, patch, {manual=true}={})=>{
+    if(blockIfWeekMismatch()) return false;
+    setJobs(p=>p.map(j=>{
+      if(j.id!==id) return j;
+      let u={...j,...patch};
+      if(manual) u={...u,manualEdited:true,schedulerDecisionCode:'manual_edit'};
+      if(patch.cleanerIds) u={...u,cleanerIds:dedupeCleanerIds(patch.cleanerIds)};
+      u=stripEarlyLeaveForOverriddenCleaners(u);
+      return {...u,status:calcJobStatus(u)};
+    }));
+    return true;
+  };
+  const printSupervisorWeek=()=>{
+    if(blockIfWeekMismatch()) return;
+    if(!jobs.length) return;
+    try{const proceed=confirmScheduleExportDespiteBlockingIssues(jobs,weekOffset,showToast,'Supervisor');if(!proceed)return;exportSupervisorScheduleXLSX(jobs,weekOffset,conflicts);showToast?.('✓ Export Supervisor avviato','ok');}
+    catch(e){showToast?.('Export Supervisor fallito: '+String(e.message||e),'error');console.error('[Supervisor export]',e);}
+  };
   const saveJob=form=>{
     if(blockIfWeekMismatch()) return;
     const cleanForm={...form,cleanerIds:dedupeCleanerIds(form.cleanerIds)};
@@ -14670,6 +15192,16 @@ function App(){
     <div style={{background:C.bg,minHeight:'100vh',fontFamily:"'Nunito',sans-serif",display:'flex',flexDirection:'column'}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}button{font-family:'Nunito',sans-serif;outline:none}textarea,input,select{font-family:'Nunito',sans-serif;outline:none}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#ccc;border-radius:2px}`}</style>
       <Toast toast={toast}/>
+      {tableMounted&&<div style={{display:(tab==='table'&&isDesktop)?'block':'none'}}><ViewBoundary name="Tabella"><TableView
+        jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} initialDay={selDay}
+        publishLabel={dirty?'● Modifiche non pubblicate':(publishedStatus==='loaded'?'✓ Tutto pubblicato':'Settimana non ancora pubblicata')}
+        publishBusy={publishing} onPublish={()=>publishCurrentSchedule()} onPrint={printSupervisorWeek}
+        onUpdateJob={updateJobFromTable} onOpenCleaner={openCleanerWeek}
+        onClose={()=>{setTab(tableBackTabRef.current||'week');setTableMounted(false);}} onMinimize={()=>setTab(tableBackTabRef.current||'week')}
+        showToast={showToast}/></ViewBoundary></div>}
+      {tableMounted&&isDesktop&&tab!=='table'&&<button onClick={()=>setTab('table')} title="Riapri la tabella com'era"
+        style={{position:'fixed',right:20,bottom:20,zIndex:250,display:'flex',alignItems:'center',gap:8,background:'#0E0D0C',color:'#F7F3EC',border:'1px solid rgba(255,255,255,0.18)',borderRadius:12,padding:'10px 16px',fontWeight:800,fontSize:13,cursor:'pointer',fontFamily:'inherit',boxShadow:'0 10px 30px rgba(0,0,0,0.25)'}}>
+        📊 Tabella{dirty?' · modifiche non pubblicate':''} · Riapri</button>}
 
       {isDesktop?(
         // ── DESKTOP LAYOUT ──
@@ -15070,6 +15602,8 @@ function App(){
       {modal==='overwriteDiff'&&<Modal onClose={()=>setModal(null)}><OverwriteDiffModal localJobs={jobs} publishedJobs={publishedJobsSnapshot?.jobs||[]} onClose={()=>setModal(null)} onConfirm={()=>{setModal(null); publishCurrentSchedule(true);}}/></Modal>}
       {modal==='cleanerWeek'&&quickCleanerId&&<Modal onClose={()=>{setModal(null);setQuickCleanerId(null);}}>
         <CleanerWeekPopup cleanerId={quickCleanerId} jobs={jobs} weekOffset={weekOffset}/>
+        <button onClick={async()=>{ if(blockIfWeekMismatch()) return; const ok=await copyTextToClipboard(buildCleanerWeekText(quickCleanerId,jobs,weekOffset)); showToast(ok?'Turni copiati: incollali o seguili in When I Work':'Copia non riuscita',ok?'ok':'error'); }}
+          style={{marginTop:16,width:'100%',padding:'12px',borderRadius:10,background:'#A66A43',color:'white',fontWeight:800,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>📋 Copia per When I Work</button>
         <button onClick={()=>{setModal(null);setQuickCleanerId(null);}} style={{marginTop:16,width:'100%',padding:'12px',borderRadius:10,background:'#F0EDE8',color:C.text,fontWeight:700,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>Chiudi</button>
       </Modal>}
     </div>
