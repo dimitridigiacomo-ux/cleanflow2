@@ -10291,11 +10291,17 @@ function TableView({ jobs, conflicts, weekOffset, initialDay, publishLabel, publ
     const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2);
     const picked = rows.slice(r1, r2 + 1).filter(isManualJob);
     if(!picked.length){ showToast('Seleziona una riga con la M per sbloccarla', 'warn'); return; }
-    const patch = { manualEdited:false, schedulerDecisionCode:'' };
-    pushUndo(picked.map(j => { const en = makeEntry(j, patch, false); return onUpdateJob(j.id, patch, { manual:false }) ? en : null; }));
-    const locked = picked.filter(isLockedTemplateJob).length;
-    showToast((picked.length === 1 ? 'Turno sbloccato: Rigenera potrà ricalcolarlo' : `${picked.length} turni sbloccati: Rigenera potrà ricalcolarli`)
-      + (locked ? ` (${locked === 1 ? 'uno è' : locked + ' sono'} da template: ${locked === 1 ? 'resta protetto' : 'restano protetti'})` : ''));
+    // Unlocking gives the whole duty back to Rigenera: the manual end and per-person hours
+    // go too (else the scheduler would plan around times nobody sees any more). A rescue
+    // split keeps its own protection (rescueUsed / rescue_split are never touched).
+    const patchFor = j => ({ manualEdited:false, manualEndTime:'', cleanerTimeOverrides:{},
+      schedulerDecisionCode: j.schedulerDecisionCode === 'manual_edit' ? '' : j.schedulerDecisionCode });
+    pushUndo(picked.map(j => { const p = patchFor(j); const en = makeEntry(j, p, false); return onUpdateJob(j.id, p, { manual:false }) ? en : null; }));
+    const stillProtected = picked.filter(j => isLockedTemplateJob(j) || j.rescueUsed === true || j.schedulerDecisionCode === 'rescue_split').length;
+    const freed = picked.length - stillProtected;
+    showToast((picked.length === 1 ? 'Turno sbloccato, orari manuali tolti' : `${picked.length} turni sbloccati, orari manuali tolti`)
+      + (freed ? (freed === picked.length ? ': Rigenera potrà ricalcolarli' : `: Rigenera potrà ricalcolarne ${freed}`) : '')
+      + (stillProtected ? ` (${stillProtected === 1 ? 'uno resta protetto' : stillProtected + ' restano protetti'}: da template o split di emergenza)` : ''));
   };
   const selectionTSV = () => {
     const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
@@ -10388,7 +10394,7 @@ function TableView({ jobs, conflicts, weekOffset, initialDay, publishLabel, publ
 
       <div style={{padding:'10px 16px',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
         <button style={{...tb,opacity:undoStack.length?1:0.45}} disabled={!undoStack.length} onClick={undo} title="Annulla l'ultima modifica (Ctrl+Z)">↶ Annulla</button>
-        <button style={tb} onClick={unlockSelection} title="Toglie la M: Rigenera potrà di nuovo ricalcolare il turno">🔓 Sblocca</button>
+        <button style={tb} onClick={unlockSelection} title="Toglie la M e gli orari manuali (fine e orari personali): Rigenera potrà di nuovo ricalcolare il turno">🔓 Sblocca</button>
         <span style={{width:1,height:22,background:'#E3DCD3',margin:'0 4px'}}/>
         <span style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'#6E655C'}}>Riepiloghi</span>
         <button style={widgets.cleaner?tbOn:tb} onClick={()=>toggle('cleaner')}>👥 Turni per cleaner</button>
@@ -13815,7 +13821,21 @@ function App(){
           && draft.basePublishedAt === result.publishedAt
           && draft.savedAt && result.publishedAt
           && draft.savedAt > result.publishedAt;
-        if(draftIsValid || (pendingOverwrite && draftHasJobs)){
+        // A draft is saved only for unpublished changes and cleared after a successful
+        // publish, so a draft whose base is an OLDER publish holds work that a newer publish
+        // (another device or supervisor, e.g. while this session was logged out) never saw.
+        // Keep it as a conflict: the next publish shows the overwrite diff, as after a
+        // publish conflict. Before, it was replaced by the server version without a word.
+        const draftOnOlderBase = draftHasJobs && !!draft.basePublishedAt && !!result.publishedAt
+          && draft.basePublishedAt !== result.publishedAt;
+        if(draftOnOlderBase && !pendingOverwrite){
+          markPendingOverwriteWarning(weekStartISO);
+          setServerVersionChanged(true);
+          const who = result.publishedBy || 'un altro supervisor';
+          const when = new Date(result.publishedAt).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
+          showToast(`Nel frattempo ${who} ha pubblicato questa settimana (${when}): tengo le tue modifiche non pubblicate. Quando pubblichi vedrai le differenze.`, 'warn');
+        }
+        if(draftIsValid || ((pendingOverwrite || draftOnOlderBase) && draftHasJobs)){
           const cleanDraft = cleanRestoredJobs(draft.jobs, 'draft published week');
           console.log('[CleanFlow restore path]','draft published week',{before:draft.jobs.length,after:cleanDraft.length});
           setJobs(prev=>{
