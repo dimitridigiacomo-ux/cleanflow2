@@ -2744,6 +2744,10 @@ const normalizeJobsForCompare = (jobs) => {
       if(k==='cleanerIds') v = Array.isArray(v) ? [...v].map(String).sort() : [];
       else if(k==='duration') v = Number(v)||0;
       else if(k==='cleanersRequired') v = parseInt(v,10) || 1;
+      // The backend stores an empty priority as 'Normal' and an empty status as 'unassigned'
+      // (jobToRow): a draft and the same plan read back from the sheet must compare equal.
+      else if(k==='priority') v = (v===undefined||v===null||v==='') ? 'Normal' : String(v);
+      else if(k==='status') v = (v===undefined||v===null||v==='') ? 'unassigned' : String(v);
       // cleanerTimeOverrides is an object keyed by cleanerId — serialize deterministically
       // (sorted keys) so key-insertion order never causes a false dirty flag.
       else if(k==='cleanerTimeOverrides'){
@@ -10292,16 +10296,18 @@ function TableView({ jobs, conflicts, weekOffset, initialDay, publishLabel, publ
     const picked = rows.slice(r1, r2 + 1).filter(isManualJob);
     if(!picked.length){ showToast('Seleziona una riga con la M per sbloccarla', 'warn'); return; }
     // Unlocking gives the whole duty back to Rigenera: the manual end and per-person hours
-    // go too (else the scheduler would plan around times nobody sees any more). A rescue
-    // split keeps its own protection (rescueUsed / rescue_split are never touched).
-    const patchFor = j => ({ manualEdited:false, manualEndTime:'', cleanerTimeOverrides:{},
-      schedulerDecisionCode: j.schedulerDecisionCode === 'manual_edit' ? '' : j.schedulerDecisionCode });
+    // go too (else the scheduler would plan around times nobody sees any more). A duty that
+    // stays protected (template, rescue split) keeps its hours, since Rigenera never
+    // recomputes it; rescueUsed / rescue_split are never touched.
+    const staysProtected = j => isLockedTemplateJob(j) || j.rescueUsed === true || j.schedulerDecisionCode === 'rescue_split';
+    const patchFor = j => ({ manualEdited:false,
+      schedulerDecisionCode: j.schedulerDecisionCode === 'manual_edit' ? '' : j.schedulerDecisionCode,
+      ...(staysProtected(j) ? {} : { manualEndTime:'', cleanerTimeOverrides:{} }) });
     pushUndo(picked.map(j => { const p = patchFor(j); const en = makeEntry(j, p, false); return onUpdateJob(j.id, p, { manual:false }) ? en : null; }));
-    const stillProtected = picked.filter(j => isLockedTemplateJob(j) || j.rescueUsed === true || j.schedulerDecisionCode === 'rescue_split').length;
+    const stillProtected = picked.filter(staysProtected).length;
     const freed = picked.length - stillProtected;
-    showToast((picked.length === 1 ? 'Turno sbloccato, orari manuali tolti' : `${picked.length} turni sbloccati, orari manuali tolti`)
-      + (freed ? (freed === picked.length ? ': Rigenera potrà ricalcolarli' : `: Rigenera potrà ricalcolarne ${freed}`) : '')
-      + (stillProtected ? ` (${stillProtected === 1 ? 'uno resta protetto' : stillProtected + ' restano protetti'}: da template o split di emergenza)` : ''));
+    showToast((freed ? (freed === 1 ? 'Turno sbloccato, orari manuali tolti: Rigenera potrà ricalcolarlo' : `${freed} turni sbloccati, orari manuali tolti: Rigenera potrà ricalcolarli`) : 'M tolta')
+      + (stillProtected ? ` (${stillProtected === 1 ? 'uno resta protetto, con i suoi orari' : stillProtected + ' restano protetti, con i loro orari'}: da template o split di emergenza)` : ''));
   };
   const selectionTSV = () => {
     const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
@@ -10674,7 +10680,7 @@ const StatPill=({label,value,color,onClick})=>(
 // unpublished-week (no published snapshot but local jobs exist).
 // issueCount uses a real union: jobs that are either in conflict OR needs_review.
 function PublishedScheduleBanner({
-  publishedStatus, publishedJobsSnapshot, dirty, draftRestored, publishing,
+  publishedStatus, publishedJobsSnapshot, dirty, draftRestored, publishing, serverVersionChanged=false,
   jobs, conflicts, weekMismatchActive,
   onPublish, onDiscard, compact=false,
 }){
@@ -10733,6 +10739,7 @@ function PublishedScheduleBanner({
                 {!compact && <span style={{color:'#B45309'}}>— pubblica per renderle visibili su altri dispositivi.</span>}
                 {issueBadge(issueCount)}
                 {draftRestored && <span style={{marginLeft:6,padding:'1px 8px',borderRadius:6,background:'#FEF3C7',color:'#92400E',fontWeight:700}}>📝 Bozza locale ripristinata</span>}
+                {serverVersionChanged && <span title="Quando pubblichi vedrai cosa cambia rispetto alla versione pubblicata" style={{marginLeft:6,padding:'1px 8px',borderRadius:6,background:'#FEE2E2',color:'#991B1B',fontWeight:700}}>⚠ C'è una versione pubblicata più recente{publishedJobsSnapshot.meta.publishedBy?` (${publishedJobsSnapshot.meta.publishedBy})`:''}</span>}
               </>
             ) : (
               <>
@@ -13821,21 +13828,27 @@ function App(){
           && draft.basePublishedAt === result.publishedAt
           && draft.savedAt && result.publishedAt
           && draft.savedAt > result.publishedAt;
-        // A draft is saved only for unpublished changes and cleared after a successful
-        // publish, so a draft whose base is an OLDER publish holds work that a newer publish
-        // (another device or supervisor, e.g. while this session was logged out) never saw.
-        // Keep it as a conflict: the next publish shows the overwrite diff, as after a
-        // publish conflict. Before, it was replaced by the server version without a word.
-        const draftOnOlderBase = draftHasJobs && !!draft.basePublishedAt && !!result.publishedAt
+        // A draft on an OLDER publish that still differs from the server holds work a newer
+        // publish (another device or supervisor, e.g. while this session was logged out)
+        // never saw: keep it as a conflict (the next publish shows the overwrite diff) instead
+        // of replacing it without a word. A draft identical to the server (a publish whose
+        // reply was lost, or edits undone) has nothing left to protect and is cleared below.
+        const draftDiffers = draftHasJobs && normalizeJobsForCompare(draft.jobs) !== normalizeJobsForCompare(result.jobs);
+        const draftOnOlderBase = draftDiffers && !!draft.basePublishedAt && !!result.publishedAt
           && draft.basePublishedAt !== result.publishedAt;
+        if(pendingOverwrite && draftHasJobs && !draftDiffers){
+          clearPendingOverwriteWarning(weekStartISO);
+          setServerVersionChanged(false);
+        }
         if(draftOnOlderBase && !pendingOverwrite){
           markPendingOverwriteWarning(weekStartISO);
           setServerVersionChanged(true);
-          const who = result.publishedBy || 'un altro supervisor';
+          const me = ((getSession()||{}).user||{}).displayName;
+          const who = !result.publishedBy ? 'un altro supervisor' : (result.publishedBy === me ? 'tu, da un altro dispositivo,' : result.publishedBy);
           const when = new Date(result.publishedAt).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
           showToast(`Nel frattempo ${who} ha pubblicato questa settimana (${when}): tengo le tue modifiche non pubblicate. Quando pubblichi vedrai le differenze.`, 'warn');
         }
-        if(draftIsValid || ((pendingOverwrite || draftOnOlderBase) && draftHasJobs)){
+        if(draftIsValid || ((pendingOverwrite && draftDiffers) || draftOnOlderBase)){
           const cleanDraft = cleanRestoredJobs(draft.jobs, 'draft published week');
           console.log('[CleanFlow restore path]','draft published week',{before:draft.jobs.length,after:cleanDraft.length});
           setJobs(prev=>{
@@ -13917,7 +13930,13 @@ function App(){
     if(weekMismatchActive) return;
     const weekStartISO = getWeekStartISO(weekOffset);
     if(publishedJobsSnapshot){
-      if(!dirty) return;
+      if(!dirty){
+        // Back to exactly the published plan (edits undone, or a publish whose reply was
+        // lost): a leftover draft would come back later as if it were unpublished work.
+        if(loadDraft(weekStartISO)) clearDraft(weekStartISO);
+        if(hasPendingOverwriteWarning(weekStartISO)){ clearPendingOverwriteWarning(weekStartISO); setServerVersionChanged(false); }
+        return;
+      }
       const basePublishedAt = publishedJobsSnapshot.meta.publishedAt;
       const handle = setTimeout(()=>{ saveDraft(weekStartISO, jobs, basePublishedAt); }, 400);
       return ()=>clearTimeout(handle);
@@ -15214,7 +15233,7 @@ function App(){
       <Toast toast={toast}/>
       {tableMounted&&<div style={{display:(tab==='table'&&isDesktop)?'block':'none'}}><ViewBoundary name="Tabella"><TableView
         jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} initialDay={selDay}
-        publishLabel={dirty?'● Modifiche non pubblicate':(publishedStatus==='loaded'?'✓ Tutto pubblicato':'Settimana non ancora pubblicata')}
+        publishLabel={dirty?(serverVersionChanged?'⚠ Modifiche non pubblicate · c\'è una versione pubblicata più recente':'● Modifiche non pubblicate'):(publishedStatus==='loaded'?'✓ Tutto pubblicato':'Settimana non ancora pubblicata')}
         publishBusy={publishing} onPublish={()=>publishCurrentSchedule()} onPrint={printSupervisorWeek}
         onUpdateJob={updateJobFromTable} onOpenCleaner={openCleanerWeek}
         onClose={()=>{setTab(tableBackTabRef.current||'week');setTableMounted(false);}} onMinimize={()=>setTab(tableBackTabRef.current||'week')}
@@ -15233,7 +15252,7 @@ function App(){
               publishedStatus={publishedStatus}
               publishedJobsSnapshot={publishedJobsSnapshot}
               dirty={dirty}
-              draftRestored={draftRestored}
+              draftRestored={draftRestored} serverVersionChanged={serverVersionChanged}
               publishing={publishing}
               jobs={jobs}
               conflicts={conflicts}
@@ -15341,7 +15360,7 @@ function App(){
             publishedStatus={publishedStatus}
             publishedJobsSnapshot={publishedJobsSnapshot}
             dirty={dirty}
-            draftRestored={draftRestored}
+            draftRestored={draftRestored} serverVersionChanged={serverVersionChanged}
             publishing={publishing}
             jobs={jobs}
             conflicts={conflicts}
