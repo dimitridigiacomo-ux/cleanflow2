@@ -8,11 +8,14 @@ Non serve nessuna dipendenza: basta Node 18+ e git.
 node tools/harness/verify-scheduler.js   # regressione + invarianti rigenerazione parziale
 node tools/harness/verify-solver.js      # solver locale + barriera max-worked-days
 node tools/harness/verify-hostaway-merge.js   # re-import Hostaway "solo novità" (dati sintetici, pochi secondi)
+node tools/harness/verify-checkin-gender.js   # check-in senza vincolo uomo/donna (sintetico + scheduler su una fixture)
 ```
 
 Exit code 0 = `ALL PASS`. Le prime due suite impiegano 1–3 minuti ciascuna.
 
 `verify-hostaway-merge.js` non usa fixture: prova `mergeHostawayImportJobs` con prenotazioni inventate. Copre: import identico, prenotazione nuova, ospiti cambiati, finestra cambiata (con e senza spostamento dell'orario), turni manuali e rescue protetti, checkout che diventa B2B, prenotazione cancellata (solo segnalata), dati persi al ricaricamento ripristinati in silenzio, fallback dello scheduler, chiavi duplicate, nota della supervisor, CSV, altre settimane e template. Controllo di sensibilità: togliendo la protezione dei turni manuali, i controlli 6 e 7 falliscono.
+
+`verify-checkin-gender.js` prova la regola del 2026-10-31: se nel tab Properties `CheckinCleanersRequired` è sotto `RequiredMaleCleaners + RequiredFemaleCleaners`, il check-in ("Prepare for guest") prende quel numero di persone di qualunque genere, mentre checkout e back-to-back tengono uomo + donna. Parte A: righe del foglio inventate. Parte B: scheduler vero sulla prima fixture, stampando solo id e conteggi. Controllo di sensibilità: con `--current origin/main` (prima della regola) 11 controlli su 19 falliscono.
 
 ## Opzioni
 

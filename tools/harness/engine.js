@@ -49,6 +49,7 @@ function endOf(src, start) {
 }
 
 // opts.transform(src) lets a test inject a controlled regression (see verify-solver.js).
+// opts.seeds adds names to export beyond SEEDS (see verify-checkin-gender.js).
 function createEngineFactory(htmlPath, opts = {}) {
   let src = fs.readFileSync(htmlPath, 'utf8');
   if (opts.transform) src = opts.transform(src);
@@ -57,7 +58,8 @@ function createEngineFactory(htmlPath, opts = {}) {
   let m;
   while ((m = declRe.exec(src))) { if (!decls.has(m[2])) decls.set(m[2], src.slice(m.index, endOf(src, m.index))); }
   const refs = t => { const s = new Set(); const re = /[A-Za-z_$][\w$]*/g; let r; while ((r = re.exec(t))) s.add(r[0]); return s; };
-  const inc = new Set(), stack = [...SEEDS];
+  const seeds = [...SEEDS, ...(opts.seeds || [])];
+  const inc = new Set(), stack = [...seeds];
   while (stack.length) {
     const n = stack.pop();
     if (inc.has(n) || PROVIDED.has(n)) continue;
@@ -68,8 +70,8 @@ function createEngineFactory(htmlPath, opts = {}) {
   }
   const ordered = [...inc].map(n => ({ t: decls.get(n), i: src.indexOf(decls.get(n)) }))
     .sort((a, b) => a.i - b.i).map(x => x.t).join('\n\n');
-  const exported = SEEDS.filter(n => inc.has(n));
-  const missing = SEEDS.filter(n => !inc.has(n));
+  const exported = seeds.filter(n => inc.has(n));
+  const missing = seeds.filter(n => !inc.has(n));
 
   function buildEngine(inp) {
     let CLEANERS = inp.cleaners, PROPERTIES = inp.properties, TRAINING = inp.training, TRAVEL_BUFFERS = inp.travelBuffers;

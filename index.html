@@ -454,7 +454,8 @@ const parsePropertiesCSV = rows => {
     // sheet value → inherit Checkout Cleaners Required → last-resort default 1 — but
     // the FINAL value can never be lower than requiredMaleCleaners+requiredFemaleCleaners
     // (a job asking for 1 cleaner while requiring 1 male AND 1 female is impossible by
-    // construction). Normalized here, ONCE, at parse time, so every downstream reader
+    // construction), except for the checkinGenderFree case below, where the check-in
+    // drops the gender requirement instead. Normalized here, ONCE, at parse time, so every downstream reader
     // (Hostaway check-in job creation, getJobRequiredCleaners) sees an already-
     // consistent value and needs no correction logic of its own. This does NOT
     // introduce a check-in fallback (3→2) — that remains explicitly out of scope;
@@ -462,9 +463,15 @@ const parsePropertiesCSV = rows => {
     const rawConfiguredCheckin=parseInt(get(r,'checkinCleaners'));
     const configuredCheckinCleaners=!isNaN(rawConfiguredCheckin)&&rawConfiguredCheckin>0?rawConfiguredCheckin:null;
     const checkinGenderMin=requiredMaleCleaners+requiredFemaleCleaners;
-    const checkinCleaners=Math.max(configuredCheckinCleaners||checkoutCleaners||1, checkinGenderMin);
-    if(configuredCheckinCleaners!==null && configuredCheckinCleaners<checkinGenderMin)
-      parserWarnings.push(`CheckinCleanersRequired (${configuredCheckinCleaners}) < RequiredMaleCleaners + RequiredFemaleCleaners (${checkinGenderMin}) — valore effettivo normalizzato a ${checkinGenderMin}.`);
+    // Exception (owner decision 2026-10-31): a check-in count set EXPLICITLY below the
+    // gender split means the check-in ("Prepare for guest") needs fewer people than a
+    // checkout and no particular gender — e.g. checkout 1 male + 1 female, check-in 1
+    // person. The split stays for checkouts; check-in jobs get the configured count and
+    // no gender requirement (getJobGenderRequirement reads checkinGenderFree).
+    const checkinGenderFree=configuredCheckinCleaners!==null && configuredCheckinCleaners<checkinGenderMin;
+    const checkinCleaners=checkinGenderFree
+      ? configuredCheckinCleaners
+      : Math.max(configuredCheckinCleaners||checkoutCleaners||1, checkinGenderMin);
 
     // Fix 10M-A: required senior cleaners (strict integer parsing).
     const rawSenior = get(r,'requiredSeniorCleaners');
@@ -522,6 +529,7 @@ const parsePropertiesCSV = rows => {
       checkoutCleanersRequired:checkoutCleaners,
       checkinTaskDuration,
       checkinCleanersRequired:checkinCleaners,
+      checkinGenderFree,
       checkinTaskTime:String(get(r,'checkinTaskTime')||'').trim(),
       cleaningWindowStart,cleaningWindowEnd,
       requiredMaleCleaners,
@@ -1461,8 +1469,12 @@ const getJobRequiredCleaners = job => {
     // no check-in config at all. Then the gender-minimum floor is applied on top.
     const isManualOverride = job.manualEdited === true || job.schedulerDecisionCode === 'manual_edit';
     const jobVal = (job.cleanersRequired && Number(job.cleanersRequired)>0) ? Number(job.cleanersRequired) : null;
+    // On a checkinGenderFree property a manual edit (times, people) does not make the
+    // stored count a supervisor choice — only custom jobs edit it — and that value may
+    // still be the one the old parser raised to the gender split: the sheet wins.
+    const trustManual = isManualOverride && prop?.checkinGenderFree !== true;
     let configured;
-    if((isCustomConfigJob(job) || isManualOverride) && jobVal!==null){
+    if((isCustomConfigJob(job) || trustManual) && jobVal!==null){
       // 1. custom job config, or 2. genuine supervisor override → trust the stored value.
       configured = jobVal;
     } else if(prop?.checkinCleanersRequired && Number(prop.checkinCleanersRequired)>0){
@@ -1493,9 +1505,13 @@ const getJobRequiredCleaners = job => {
 
 // ── GENDER REQUIREMENTS ─────────────────────────────────────────────────────
 // Required male/female cleaners for a job, from the CURRENT property (0/0 if none).
+// A check-in job of a property whose check-in count is below its gender split
+// (checkinGenderFree, see parsePropertiesCSV) has no gender requirement.
 const getJobGenderRequirement = job => {
   const prop = PROPERTIES.find(p=>p.id===job?.propertyId);
   if(!prop) return { male:0, female:0 };
+  if(prop.checkinGenderFree === true && (job.type==='checkin' || job.serviceTypeId===HOSTAWAY_ST_CHECKIN))
+    return { male:0, female:0 };
   return {
     male:   Number(prop.requiredMaleCleaners)   || 0,
     female: Number(prop.requiredFemaleCleaners) || 0,
@@ -8953,8 +8969,10 @@ const buildJobDebugDiagnostic = (job, ctx, debugMeta) => {
   if(job.serviceTypeId && !SERVICE_TYPE_IDS.has(job.serviceTypeId)) dataNotices.push(`serviceTypeId sconosciuto: "${job.serviceTypeId}"`);
   // Micro-fix 1: surface when a check-in job's configured cleaner count was below its
   // gender minimum and getJobRequiredCleaners normalized it upward. Diagnostic only —
-  // the effective `required` above already reflects the corrected value; gender
-  // requirements are never silently reduced.
+  // the effective `required` above already reflects the corrected value. A property
+  // with checkinGenderFree has no gender minimum on check-in: say so instead.
+  if((job.type==='checkin' || job.serviceTypeId===HOSTAWAY_ST_CHECKIN) && prop?.checkinGenderFree === true)
+    dataNotices.push('Check-in senza vincolo uomo/donna: CheckinCleanersRequired è sotto il minimo uomo/donna del checkout.');
   if((job.type==='checkin' || job.serviceTypeId===HOSTAWAY_ST_CHECKIN)){
     const genderMin = (Number(genReq.male)||0) + (Number(genReq.female)||0);
     // Mirror the precedence used by getJobRequiredCleaners so the notice reports the
@@ -8962,7 +8980,8 @@ const buildJobDebugDiagnostic = (job, ctx, debugMeta) => {
     const isManualOverride = job.manualEdited === true || job.schedulerDecisionCode === 'manual_edit';
     const jobVal = (job.cleanersRequired && Number(job.cleanersRequired)>0) ? Number(job.cleanersRequired) : null;
     let configuredCheckin;
-    if((isCustomConfigJob(job) || isManualOverride) && jobVal!==null) configuredCheckin = jobVal;
+    const trustManual = isManualOverride && prop?.checkinGenderFree !== true;
+    if((isCustomConfigJob(job) || trustManual) && jobVal!==null) configuredCheckin = jobVal;
     else if(prop?.checkinCleanersRequired && Number(prop.checkinCleanersRequired)>0) configuredCheckin = Number(prop.checkinCleanersRequired);
     else if(prop?.cleanersRequired && Number(prop.cleanersRequired)>0) configuredCheckin = Number(prop.cleanersRequired);
     else if(jobVal!==null) configuredCheckin = jobVal;
