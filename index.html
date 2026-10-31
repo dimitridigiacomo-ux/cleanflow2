@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="it"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>CleanFlow</title><script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script><script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script><style>* { box-sizing: border-box; margin: 0; padding: 0; } body { background: #F5F2EE; }</style><script>const CF_GEMINI_PLACEHOLDER = "__GEMINI_" + "API_KEY__"; window.__CF_CONFIG__ = { geminiKey: "__GEMINI_API_KEY__" }; if(window.__CF_CONFIG__.geminiKey === CF_GEMINI_PLACEHOLDER) window.__CF_CONFIG__.geminiKey = "";</script></head><body><div id="root"></div>
+<html lang="it"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>CleanFlow</title><script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" integrity="sha384-tMH8h3BGESGckSAVGZ82T9n90ztNXxvdwvdM6UoR56cYcf+0iGXBliJ29D+wZ/x8" crossorigin="anonymous"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" integrity="sha384-bm7MnzvK++ykSwVJ2tynSE5TRdN+xL418osEVF2DE/L/gfWHj91J2Sphe582B1Bh" crossorigin="anonymous"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" integrity="sha384-aGlMNK3U/x0wl4lEH5jD1PGhJlX9hApuPmIiA5gtiYCOQ1J8ejIdC0btaU/TMoBD" crossorigin="anonymous"></script><script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js" integrity="sha384-OUW9euuUyxyHcAhTqbhI+Iyb8LMssXt/cpz0yXhs9UWG2/R/uaWdakx/4cfww7Vb" crossorigin="anonymous"></script><style>* { box-sizing: border-box; margin: 0; padding: 0; } body { background: #F5F2EE; }</style><script>const CF_GEMINI_PLACEHOLDER = "__GEMINI_" + "API_KEY__"; window.__CF_CONFIG__ = { geminiKey: "__GEMINI_API_KEY__" }; if(window.__CF_CONFIG__.geminiKey === CF_GEMINI_PLACEHOLDER) window.__CF_CONFIG__.geminiKey = "";</script></head><body><div id="root"></div>
 <script type="text/babel">const { useState, useRef, useEffect, useCallback, useMemo } = React;
 
 // ── PALETTE ────────────────────────────────────────────────────────────────────
@@ -2629,18 +2629,84 @@ const createDebugTraceCollector = ({ enabled, runId, weekOffset }) => {
 
 
 // ─── PUBLISHED SCHEDULE API (Google Apps Script Web App) ───────────────────
-// ⚠️ PILOT SECURITY NOTE (not production auth):
-// The login password (see pwInput check in the login screen) is a client-side
-// SOFT GATE for a trusted pilot only — the literal ships in the bundle and is
-// readable in DevTools. This Apps Script endpoint is deployed "Anyone with the
-// link" and accepts unauthenticated POSTs that REPLACE an entire week.
-// Acceptable ONLY because the deployment URL is private and shared with trusted
-// staff. For production this MUST be replaced with real auth (server-side secret
-// validation in Apps Script, or Google sign-in / Cloudflare Access).
-// Backend endpoint for shared schedule persistence across devices.
-// GET ?weekStartISO=YYYY-MM-DD  → fetch published schedule for that week
-// POST { weekStartISO, weekEndISO, publishedBy, jobs } → publish a week (v2)
+// Login is server-side (Auth.gs in the private backend repo): the app sends
+// username + password once (cfLogin), keeps the returned session token in
+// localStorage, and sends it with EVERY call in a text/plain POST body (Apps Script
+// cannot read custom headers; text/plain avoids a CORS preflight).
+// Actions: cfLogin, cfLogout, cfSession, cfGetPublished, cfPublish,
+// cfHostawayReservations (+ owner-only cfHostawayListings / cfTestHostaway).
+// "Published by" is set by the server from the session, never by the client.
 const PUBLISHED_API_URL = 'https://script.google.com/macros/s/AKfycbxak7U7rOsv96qzbl1kgizUbyWENh3a9NXsDiWyNRJHEPuDmZgkOPUVkXrqyG4ZV-RO/exec';
+
+// Dev only: on localhost a local mock backend can be used for end-to-end tests
+// (localStorage cf_api_url_dev). Ignored on every other host, production included.
+const getApiUrl = () => {
+  try {
+    if(/^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)){
+      const dev = localStorage.getItem('cf_api_url_dev');
+      if(dev) return dev;
+    }
+  } catch(e) {}
+  return PUBLISHED_API_URL;
+};
+
+// ─── Session (server-issued token, valid 7 days) ───────────────────────────
+const SESSION_KEY = 'cf_session_v1';
+const LAST_USER_KEY = 'cf_last_user';
+const getSession = () => {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    if(s && s.token && s.user && !(s.expiresAt && Date.parse(s.expiresAt) <= Date.now())) return s;
+  } catch(e) {}
+  return null;
+};
+const saveSession = (s) => { try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); localStorage.setItem(LAST_USER_KEY, s.user.username); } catch(e) {} };
+const clearSession = () => { try { localStorage.removeItem(SESSION_KEY); } catch(e) {} };
+const getLastUsername = () => { try { return localStorage.getItem(LAST_USER_KEY) || ''; } catch(e) { return ''; } };
+// Debug Center is for the owner only. It shows in-memory data the user already has,
+// so this is a UI gate; owner-only DATA is enforced by the server.
+const canSeeDebug = () => CLEANFLOW_DEBUG_CENTER_ENABLED && ((getSession() || {}).user || {}).role === 'superadmin';
+
+// Set by App: called when the server rejects the session (expired, revoked, user
+// disabled) so the login shows again without discarding in-memory work.
+let __cfOnAuthLost = null;
+// Set by App: called when the server requires the provisional password to be changed.
+let __cfOnMustChange = null;
+const CF_AUTH_LOST_CODES = ['AUTH_REQUIRED', 'AUTH_EXPIRED', 'AUTH_INVALID_SESSION'];
+
+// Single entry point for every backend call. Never throws: failures come back as
+// { ok:false, error } (plus timeout:true on timeout), like the old fetch helpers.
+const cfApi = async (action, payload={}, { timeoutMs=60000 }={}) => {
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), timeoutMs);
+  try {
+    const s = getSession();
+    const sentToken = s ? s.token : undefined;
+    const res = await fetch(getApiUrl(), {
+      method:'POST',
+      redirect:'follow',
+      headers:{'Content-Type':'text/plain;charset=utf-8'}, // text/plain to avoid CORS preflight
+      body: JSON.stringify({ ...payload, action, token: s ? s.token : undefined }),
+      signal: controller.signal,
+    });
+    if(!res.ok) return { ok:false, error:`HTTP ${res.status}` };
+    const data = await res.json();
+    if(data && data.ok===false && CF_AUTH_LOST_CODES.includes(data.code)){
+      const current = getSession();
+      if(!current || current.token === sentToken){ // ignore replies about an older session
+        clearSession();
+        if(__cfOnAuthLost) __cfOnAuthLost(data.error);
+      }
+    }
+    if(data && data.code==='PASSWORD_CHANGE_REQUIRED' && __cfOnMustChange) __cfOnMustChange();
+    return data || { ok:false, error:'Risposta vuota dal server' };
+  } catch(e) {
+    if(e.name==='AbortError') return { ok:false, timeout:true, error:'Timeout: il server non ha risposto' };
+    return { ok:false, error: String(e.message||e) };
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 // Compute weekStartISO (Monday) from a weekOffset relative to current week
 const getWeekStartISO = (weekOffset=0) => toISODateLocal(getWeekDates(weekOffset)[0]);
@@ -2649,41 +2715,20 @@ const getWeekEndISO   = (weekOffset=0) => toISODateLocal(getWeekDates(weekOffset
 // Fetch published schedule for a given weekStartISO. Always resolves to a result object,
 // never throws — failure modes are reported via { ok:false, error } so callers can decide.
 const fetchPublishedSchedule = async (weekStartISO) => {
-  try {
-    const url = `${PUBLISHED_API_URL}?weekStartISO=${encodeURIComponent(weekStartISO)}`;
-    const res = await fetch(url, { method:'GET', redirect:'follow' });
-    if(!res.ok) return { ok:false, error:`HTTP ${res.status}` };
-    const data = await res.json();
-    if(!data || data.ok!==true) return { ok:false, error:(data&&data.error)||'Unknown API error' };
-    return data; // { ok, exists, weekStartISO, weekEndISO, snapshotId, publishedAt, publishedBy, jobs }
-  } catch(e) {
-    return { ok:false, error: String(e.message||e) };
-  }
+  const data = await cfApi('cfGetPublished', { weekStartISO });
+  if(!data || data.ok!==true) return { ok:false, error:(data&&data.error)||'Unknown API error' };
+  return data; // { ok, exists, weekStartISO, weekEndISO, snapshotId, publishedAt, publishedBy, jobs }
 };
 
 // POST current jobs to the backend. Replaces the entire week atomically server-side.
+// `publishedBy` stays in the signature for the callers but is NOT sent: the server
+// takes it from the logged-in session.
 const publishScheduleToBackend = async (weekStartISO, weekEndISO, publishedBy, jobs, baseSnapshotId=null) => {
-  const controller = new AbortController();
-  const timer = setTimeout(()=>controller.abort(), 30000);
-  try {
-    const res = await fetch(PUBLISHED_API_URL, {
-      method:'POST',
-      redirect:'follow',
-      headers:{'Content-Type':'text/plain;charset=utf-8'}, // text/plain to avoid CORS preflight
-      body: JSON.stringify({ weekStartISO, weekEndISO, publishedBy, jobs, baseSnapshotId }),
-      signal: controller.signal,
-    });
-    if(!res.ok) return { ok:false, error:`HTTP ${res.status}` };
-    const data = await res.json();
-    // Pass through conflict payload as-is so the caller can show details.
-    if(!data || data.ok!==true) return data && data.error ? data : { ok:false, error:(data&&data.error)||'Unknown API error' };
-    return data; // { ok, snapshotId, publishedAt, rowCount, weekStartISO, weekEndISO }
-  } catch(e) {
-    if(e.name==='AbortError') return { ok:false, error:'Timeout pubblicazione: backend non ha risposto entro 30s' };
-    return { ok:false, error: String(e.message||e) };
-  } finally {
-    clearTimeout(timer);
-  }
+  const data = await cfApi('cfPublish', { weekStartISO, weekEndISO, jobs, baseSnapshotId }, { timeoutMs:30000 });
+  if(data && data.timeout) return { ok:false, error:'Timeout pubblicazione: backend non ha risposto entro 30s' };
+  // Pass through conflict payload as-is so the caller can show details.
+  if(!data || data.ok!==true) return data && data.error ? data : { ok:false, error:(data&&data.error)||'Unknown API error' };
+  return data; // { ok, snapshotId, publishedAt, rowCount, weekStartISO, weekEndISO, publishedBy }
 };
 
 // ─── Operational job normalization for dirty-comparison ────────────────────
@@ -2699,6 +2744,10 @@ const normalizeJobsForCompare = (jobs) => {
       if(k==='cleanerIds') v = Array.isArray(v) ? [...v].map(String).sort() : [];
       else if(k==='duration') v = Number(v)||0;
       else if(k==='cleanersRequired') v = parseInt(v,10) || 1;
+      // The backend stores an empty priority as 'Normal' and an empty status as 'unassigned'
+      // (jobToRow): a draft and the same plan read back from the sheet must compare equal.
+      else if(k==='priority') v = (v===undefined||v===null||v==='') ? 'Normal' : String(v);
+      else if(k==='status') v = (v===undefined||v===null||v==='') ? 'unassigned' : String(v);
       // cleanerTimeOverrides is an object keyed by cleanerId — serialize deterministically
       // (sorted keys) so key-insertion order never causes a false dirty flag.
       else if(k==='cleanerTimeOverrides'){
@@ -3113,6 +3162,98 @@ const generateApiJobsFromReservations = (reservations, weekOffset=0, mapById=HOS
   diagnostics.generatedJobs = jobs.length;
   return { jobs, diagnostics };
 };
+
+// ── HOSTAWAY RE-IMPORT MERGE ──────────────────────────────────────────────────
+// A second "Importa Hostaway" for the same week must not throw the plan away. Duties that
+// are still the same keep their people and manual changes; only what Hostaway changed is
+// updated; new bookings are added unassigned; duties no longer in Hostaway are only
+// reported, never removed here (the supervisor decides).
+// Pairing an imported row with a planned duty, in this order (one-to-one):
+//  1. same date + property + type (checkout on the departure day, checkin on the arrival
+//     day) AND identical Hostaway data, so two duties sharing a key never swap data;
+//  2. same date + property + type, remaining ones in order;
+//  3. same booking number ("Res N" in the generated note) and type: a duty moved to
+//     another day by hand.
+// What is compared, and why:
+//  - guests: display data, refreshed and reported;
+//  - service type and time window (flexible duties) or start time (fixed duties): the
+//    Hostaway-owned timing. For flexible duties the scheduler picks startTime inside the
+//    window, so startTime itself is NOT compared; it only moves when it falls outside the
+//    new window. Never applied to manual/rescue duties: those are reported instead;
+//  - duration and cleanersRequired come from the Properties tab and the scheduler
+//    fallback, not from Hostaway: never compared;
+//  - constraintStartTime/EndTime are not kept by the backend: restored silently (they are
+//    not in OPERATIONAL_FIELDS, so this never shows as an unpublished change);
+//  - note and displayName are never refreshed silently; the generated Hostaway note is
+//    rewritten only together with a timing change on a non-protected duty.
+// Only rows of the import week are merged; the caller deals with rows of other weeks.
+const HOSTAWAY_MERGE_GUEST_FIELDS = ['guestCount','guestAdults','guestChildren','guestInfants','guestPets','incomingGuestCount','incomingAdults','incomingChildren','incomingInfants','incomingPets'];
+const hostawayDutyKey = j => [j.dateISO, j.propertyId, j.type].join('|');
+const hostawayResId = j => (String(j.note||'').match(/\bRes (\d+)/) || [])[1] || '';
+const sameImportValue = (a, b) => { const n = v => (v===null || v===undefined || v==='') ? '' : String(v); return n(a) === n(b); };
+const isProtectedHostawayDuty = j => j.manualEdited === true || j.schedulerDecisionCode === 'manual_edit' || j.rescueUsed === true || j.schedulerDecisionCode === 'rescue_split';
+const hostawayTimingFields = nj => (nj.flexibleWindow === true ? ['serviceTypeId','flexibleWindow','windowStartTime','windowEndTime'] : ['serviceTypeId','startTime']).filter(f => f in nj);
+const sameHostawayData = (old, nj) =>
+  hostawayTimingFields(nj).every(f => sameImportValue(old[f], nj[f])) &&
+  HOSTAWAY_MERGE_GUEST_FIELDS.every(f => !(f in nj) || sameImportValue(old[f], nj[f]));
+const mergeHostawayImportJobs = (prevJobs, incoming, { inWeek, importSource, makeId }) => {
+  const report = { added:[], timing:[], keptManual:[], guests:[], missing:[], unchanged:0 };
+  const existing = (prevJobs||[]).filter(j => j.source === importSource && inWeek(j.dateISO));
+  const rows = (incoming||[]).filter(nj => inWeek(nj.dateISO));
+  const byKey = new Map();
+  existing.forEach(j => { const k = hostawayDutyKey(j); if(!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(j); });
+  const usedOld = new Set(), usedRow = new Set(), pairs = [];
+  const pairUp = (i, old) => { usedRow.add(i); usedOld.add(old); pairs.push({ nj:rows[i], old }); };
+  const free = i => !usedRow.has(i);
+  rows.forEach((nj, i) => { const old = (byKey.get(hostawayDutyKey(nj))||[]).find(o => !usedOld.has(o) && sameHostawayData(o, nj)); if(old) pairUp(i, old); });
+  rows.forEach((nj, i) => { if(!free(i)) return; const old = (byKey.get(hostawayDutyKey(nj))||[]).find(o => !usedOld.has(o)); if(old) pairUp(i, old); });
+  rows.forEach((nj, i) => {
+    if(!free(i)) return;
+    const res = hostawayResId(nj); if(!res) return;
+    const old = existing.find(o => !usedOld.has(o) && o.type === nj.type && hostawayResId(o) === res);
+    if(old) pairUp(i, old);
+  });
+  const updates = new Map();
+  pairs.forEach(({ nj, old }) => {
+    const isProtected = isProtectedHostawayDuty(old);
+    const next = { ...old };
+    let guestsChanged = false;
+    HOSTAWAY_MERGE_GUEST_FIELDS.forEach(f => {
+      if(f in nj && !sameImportValue(old[f], nj[f])){ next[f] = nj[f] ?? null; guestsChanged = true; }
+    });
+    ['constraintStartTime','constraintEndTime'].forEach(f => { if(f in nj) next[f] = nj[f]; else delete next[f]; });
+    const diffs = hostawayTimingFields(nj).filter(f => !sameImportValue(old[f], nj[f]));
+    if(diffs.length){
+      if(isProtected){
+        report.keptManual.push({ job:old, fields:diffs, incoming:nj });
+      } else {
+        diffs.forEach(f => { next[f] = nj[f]; });
+        if(nj.flexibleWindow === true){
+          const ws = t2m(nj.windowStartTime), we = t2m(nj.windowEndTime), st = t2m(String(next.startTime||nj.startTime));
+          const dur = Math.round((Number(next.duration)||0) * 60);
+          if(!(st >= ws && st + dur <= we)) next.startTime = nj.startTime;
+        }
+        if(/^Hostaway /.test(String(old.note||'')) && typeof nj.note === 'string') next.note = nj.note;
+        // calcJobStatus never returns "unassigned": keep that status on a duty nobody staffs yet.
+        next.status = ((next.cleanerIds||[]).length === 0 && old.status === 'unassigned') ? 'unassigned' : calcJobStatus(next);
+        report.timing.push({ job:next, before:old, fields:diffs });
+      }
+    }
+    if(guestsChanged) report.guests.push(next);
+    if(!diffs.length && !guestsChanged) report.unchanged++;
+    if(JSON.stringify(next) !== JSON.stringify(old)) updates.set(old.id, next);
+  });
+  rows.forEach((nj, i) => { if(free(i)) report.added.push({ ...nj, id:makeId(), source:importSource, status:'unassigned' }); });
+  const imported = [...pairs.map(p => p.nj), ...report.added];
+  existing.forEach(o => {
+    if(usedOld.has(o)) return;
+    const b2b = o.type === 'checkin' && imported.some(x => x.type === 'checkout' && x.dateISO === o.dateISO && x.propertyId === o.propertyId);
+    report.missing.push({ job:o, reason: b2b ? 'b2b' : 'gone' });
+  });
+  report.hasNews = (report.added.length + report.timing.length + report.keptManual.length + report.guests.length + report.missing.length) > 0;
+  return { jobs:[...(prevJobs||[]).map(j => updates.get(j.id) || j), ...report.added], report };
+};
+// ── END HOSTAWAY RE-IMPORT MERGE ──
 
 const formatDayMonth = (isoString) => {
   if(!isoString) return '—';
@@ -9795,12 +9936,624 @@ function Toast({toast}){
   );
 }
 
+// Change-password form: used for the forced first-login change (dark card) and from
+// the "Password" button (inside Modal). The server checks the current password.
+function ChangePasswordForm({ dark=false, knownCurrent='', onDone, onCancel, cancelLabel='Annulla' }){
+  const [cur,setCur]=useState('');
+  const [nw,setNw]=useState('');
+  const [nw2,setNw2]=useState('');
+  const [err,setErr]=useState('');
+  const [busy,setBusy]=useState(false);
+  const submit=async()=>{
+    if(busy) return;
+    const current=knownCurrent||cur;
+    if(!current){ setErr('Inserisci la password attuale'); return; }
+    if(nw.length<10){ setErr('La nuova password deve avere almeno 10 caratteri'); return; }
+    if(nw!==nw2){ setErr('Le due password nuove non coincidono'); return; }
+    setBusy(true); setErr('');
+    const r=await cfApi('cfChangePassword',{ currentPassword:current, newPassword:nw });
+    setBusy(false);
+    if(!r||r.ok!==true){ setErr((r&&r.error)||'Cambio password non riuscito'); return; }
+    const sess=getSession(); if(sess) saveSession({ ...sess, user:{ ...sess.user, ...(r.user||{}) } });
+    setCur(''); setNw(''); setNw2('');
+    if(onDone) onDone();
+  };
+  const field={width:'100%',padding:'12px 14px',borderRadius:12,fontSize:15,fontFamily:'inherit',marginBottom:10,outline:'none',
+    border:dark?'1.5px solid rgba(255,255,255,0.18)':'1.5px solid #DDD',background:dark?'#141414':'white',color:dark?'#F7F3EC':'#1A1A1A'};
+  const onKey=e=>{ if(e.key==='Enter') submit(); };
+  return(
+    <div style={{textAlign:'left'}}>
+      {!dark&&<div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,marginBottom:6}}>Cambia password</div>}
+      {!dark&&<div style={{fontSize:13,color:'#666',marginBottom:16,lineHeight:1.5}}>Almeno 10 caratteri. Gli altri dispositivi collegati con il tuo utente verranno disconnessi.</div>}
+      {!knownCurrent&&<input type="password" placeholder="Password attuale" autoComplete="current-password" value={cur} onChange={e=>{setCur(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>}
+      <input type="password" placeholder="Nuova password" autoComplete="new-password" value={nw} onChange={e=>{setNw(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>
+      <input type="password" placeholder="Ripeti la nuova password" autoComplete="new-password" value={nw2} onChange={e=>{setNw2(e.target.value);setErr('');}} onKeyDown={onKey} style={field}/>
+      {err&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>{err}</div>}
+      <button onClick={submit} disabled={busy} style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:busy?'wait':'pointer',opacity:busy?0.7:1,fontFamily:'inherit'}}>{busy?'Salvataggio…':'Salva nuova password'}</button>
+      {onCancel&&<button onClick={onCancel} disabled={busy} style={{width:'100%',padding:'10px',marginTop:8,borderRadius:12,background:'transparent',color:dark?'rgba(255,255,255,0.55)':'#666',fontWeight:700,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>{cancelLabel}</button>}
+    </div>
+  );
+}
+
+// Error boundary: if a view, a modal or the whole app throws while rendering, show a
+// message in its place instead of a blank page. Rendering errors never change state,
+// so nothing is lost: the rest of the app keeps working. "Riprova" re-renders it.
+class ViewBoundary extends React.Component {
+  constructor(props){ super(props); this.state={ error:null }; }
+  static getDerivedStateFromError(error){ return { error }; }
+  componentDidCatch(error, info){ console.error('[CleanFlow] crash in '+(this.props.name||'view'), error, info && info.componentStack); }
+  render(){
+    const err=this.state.error;
+    if(!err) return this.props.children;
+    const root=!!this.props.root;
+    let detail=null;
+    try { if(canSeeDebug()) detail=String((err&&err.message)||err).slice(0,300); } catch(e) {}
+    return(
+      <div role="alert" style={{margin:root?'40px auto':'16px',maxWidth:520,padding:'20px 22px',borderRadius:16,background:'#FFF8E6',border:'2px solid #F0C36D',color:'#5C4200',fontFamily:"'Nunito',sans-serif"}}>
+        <div style={{fontSize:16,fontWeight:800,marginBottom:6}}>⚠️ {root?'CleanFlow ha avuto un problema':('Questa sezione ha avuto un problema'+(this.props.name?' ('+this.props.name+')':''))}</div>
+        <div style={{fontSize:13,lineHeight:1.5,marginBottom:12}}>{root?'Ricarica la pagina. Le bozze salvate sul dispositivo restano.':'I dati non sono stati modificati e il resto dell\'app funziona: puoi cambiare vista, salvare e pubblicare.'}</div>
+        {detail&&<div style={{fontSize:11,fontFamily:'monospace',background:'rgba(0,0,0,0.05)',borderRadius:8,padding:'6px 8px',marginBottom:12,wordBreak:'break-word'}}>{detail}</div>}
+        <button onClick={()=>root?window.location.reload():this.setState({error:null})} style={{padding:'9px 16px',borderRadius:10,background:'#A66A43',color:'white',fontWeight:800,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>{root?'Ricarica':'Riprova'}</button>
+      </div>
+    );
+  }
+}
+
+// Result of a Hostaway re-import merged into the plan (see mergeHostawayImportJobs).
+function HostawayImportReport({report,onClose,onRemoveMissing,onOpenJob}){
+  const FIELD={serviceTypeId:'servizio',windowStartTime:'inizio',windowEndTime:'fine finestra',startTime:'orario',flexibleWindow:'finestra'};
+  const val=(f,v)=>f==='serviceTypeId'?getSupervisorServiceLabel(v,''):(v===true?'sì':v===false?'no':(v||'—'));
+  const label=j=>`${formatDayMonth(j.dateISO)} · ${getJobDisplayName(j)} · ${getSupervisorServiceLabel(j.serviceTypeId,j.type)} ${j.startTime||''}`;
+  const MAX=8;
+  const list=(items,detail)=>(
+    <div style={{display:'grid',gap:3,marginTop:4}}>
+      {items.slice(0,MAX).map((it,i)=>{ const j=it.job||it; return (
+        <button key={(j.id||'')+i} onClick={()=>onOpenJob(j)} style={{textAlign:'left',background:'rgba(255,255,255,0.65)',border:'1px solid #EADBB8',borderRadius:8,padding:'4px 8px',fontSize:12,cursor:'pointer',fontFamily:'inherit',color:'#3D2E00'}}>
+          {label(j)}{detail&&<span style={{color:'#8A6100'}}> · {detail(it)}</span>}
+        </button>
+      );})}
+      {items.length>MAX&&<div style={{fontSize:11,color:'#8A6100'}}>…e altri {items.length-MAX}</div>}
+    </div>
+  );
+  const sec=(icon,title,body)=>(<div style={{marginTop:10}}><div style={{fontSize:13,fontWeight:800}}>{icon} {title}</div>{body}</div>);
+  return(
+    <div role="status" style={{margin:'0 0 12px',background:'#FFF8E6',border:'1.5px solid #F0C36D',borderRadius:14,padding:'12px 14px',color:'#3D2E00'}}>
+      <div style={{display:'flex',alignItems:'center',gap:8}}>
+        <div style={{fontSize:14,fontWeight:800}}>Import {report.srcLabel}: aggiornamento della settimana</div>
+        <button onClick={onClose} aria-label="Chiudi" style={{marginLeft:'auto',border:'none',background:'transparent',fontSize:18,cursor:'pointer',color:'#8A6100'}}>×</button>
+      </div>
+      <div style={{fontSize:12,color:'#6B5200',marginTop:2}}>I turni già pianificati sono rimasti com'erano ({report.unchanged} invariati). Qui sotto solo ciò che Hostaway ha cambiato.</div>
+      {report.added.length>0&&sec('＋',`${report.added.length} ${report.added.length===1?'nuovo turno':'nuovi turni'} da assegnare`,list(report.added))}
+      {report.timing.length>0&&sec('⏰',`${report.timing.length} ${report.timing.length===1?'turno cambiato':'turni cambiati'}: persone mantenute, controlla`,list(report.timing,it=>it.fields.map(f=>`${FIELD[f]||f} ${val(f,it.before[f])} → ${val(f,it.job[f])}`).join(', ')))}
+      {report.keptManual.length>0&&sec('✋',`${report.keptManual.length} ${report.keptManual.length===1?'turno modificato':'turni modificati'} a mano: Hostaway ha cambiato qualcosa, la tua modifica è stata mantenuta`,list(report.keptManual,it=>'Hostaway: '+it.fields.map(f=>`${FIELD[f]||f} ${val(f,it.incoming[f])}`).join(', ')))}
+      {report.missing.length>0&&sec('⚠',`${report.missing.length} ${report.missing.length===1?'turno non è':'turni non sono'} più nell'import Hostaway`,(<>
+        <div style={{display:'grid',gap:3,marginTop:4}}>
+          {report.missing.slice(0,MAX).map(m=>(
+            <div key={m.job.id} style={{display:'flex',gap:6,alignItems:'stretch'}}>
+              <button onClick={()=>onOpenJob(m.job)} style={{flex:1,textAlign:'left',background:'rgba(255,255,255,0.65)',border:'1px solid #EADBB8',borderRadius:8,padding:'4px 8px',fontSize:12,cursor:'pointer',fontFamily:'inherit',color:'#3D2E00'}}>
+                {label(m.job)}<span style={{color:'#8A6100'}}> · {m.reason==='b2b'?'sostituito dal back-to-back dello stesso giorno':'prenotazione cancellata o spostata'}</span>
+              </button>
+              <button onClick={()=>onRemoveMissing([m.job.id])} style={{padding:'4px 10px',borderRadius:8,background:'white',color:'#A66A43',border:'1px solid #A66A43',fontWeight:800,fontSize:12,cursor:'pointer',fontFamily:'inherit'}}>Rimuovi</button>
+            </div>
+          ))}
+          {report.missing.length>MAX&&<div style={{fontSize:11,color:'#8A6100'}}>…e altri {report.missing.length-MAX}</div>}
+        </div>
+        {report.missing.length>1&&<button onClick={()=>onRemoveMissing(report.missing.map(m=>m.job.id))} style={{marginTop:6,padding:'6px 12px',borderRadius:9,background:'#A66A43',color:'white',border:'none',fontWeight:800,fontSize:12,cursor:'pointer',fontFamily:'inherit'}}>Rimuovi tutti i {report.missing.length}</button>}
+      </>))}
+      {report.guests.length>0&&sec('👥',`Ospiti aggiornati in ${report.guests.length} ${report.guests.length===1?'turno':'turni'}`,null)}
+    </div>
+  );
+}
+
+// ── TABELLA (vista stile Excel, solo desktop) ──────────────────────────────────
+// Full-screen, spreadsheet-like editor of the week, laid out exactly like the Supervisor
+// XLSX export (same columns, cell text, row order and fills; see exportSupervisorScheduleXLSX).
+// Phase 1 edits: Start, End, Cleaners (people + per-person hours) and Notes. Every edit goes
+// through App.updateJobFromTable, i.e. the same rules as JobForm: times and people make the
+// duty "manual" (Rigenera leaves it alone); a note alone does not.
+const TABLE_COLS = [
+  { k:'start', label:'Start' }, { k:'end', label:'End' }, { k:'prop', label:'Property', ro:true },
+  { k:'service', label:'Service', ro:true }, { k:'guests', label:'Guests', ro:true },
+  { k:'cleaners', label:'Cleaners' }, { k:'notes', label:'Notes' },
+];
+// Cell colours use the shared taxonomy (isRealConflictIssue): real conflicts red, review-only yellow.
+// Display-only clock, as in the Supervisor export (a shift past midnight shows 01:00, not 25:00).
+const tableClock = minutes => { const n = ((Math.round(minutes) % 1440) + 1440) % 1440; return m2t(n); };
+const tableNormTime = v => {
+  const m = /^\s*(\d{1,2})(?:[:.,h ]?(\d{2}))?\s*$/.exec(String(v||''));
+  if(!m) return null;
+  const h = +m[1], mi = m[2] !== undefined ? +m[2] : 0;
+  return h < 24 && mi < 60 ? m2t(h*60 + mi) : null;
+};
+// Same order as the export: property DisplayOrder, start, name, id.
+const sortTableDayJobs = list => [...list].sort((a, b) => {
+  const oa = getPropertyDisplayOrder(a.propertyId), ob = getPropertyDisplayOrder(b.propertyId);
+  if(oa !== ob) return oa - ob;
+  const ta = getJobOperationalStartMinutes(a), tb = getJobOperationalStartMinutes(b);
+  if(ta !== tb) return ta - tb;
+  const na = getJobDisplayName(a), nb = getJobDisplayName(b);
+  if(na !== nb) return na.localeCompare(nb);
+  return String(a.id||'').localeCompare(String(b.id||''));
+});
+// Cell texts, built exactly like one row of the Supervisor export.
+const tableRowCells = (job, nameMap) => {
+  const validStart = isExportHHMM(job.startTime);
+  const rawNote = (job.note || '').trim();
+  return {
+    start: validStart ? tableClock(getJobOperationalStartMinutes(job)) : '',
+    end: validStart ? tableClock(getJobOperationalEndMinutes(job)) : '',
+    prop: getJobDisplayName(job),
+    service: getSupervisorServiceLabel(job.serviceTypeId, job.type),
+    guests: getSupervisorGuestCompact(getArrivalGuestDisplaySource(job)),
+    cleaners: buildSupervisorCleanersCell(job, dedupeCleanerIds(job.cleanerIds), nameMap, tableClock),
+    notes: (rawNote.startsWith('Hostaway checkout') || rawNote.startsWith('Hostaway check-in')) ? '' : rawNote,
+  };
+};
+const isManualJob = j => j.manualEdited === true || j.schedulerDecisionCode === 'manual_edit';
+
+function TableView({ jobs, conflicts, weekOffset, initialDay, publishLabel, publishBusy, onPublish, onPrint,
+                     onUpdateJob, onOpenCleaner, onClose, onMinimize, showToast }){
+  const dates = getWeekDates(weekOffset);
+  const [dayIdx, setDayIdx] = useState(() => Math.max(0, DAYS.indexOf(initialDay)));
+  const [sel, setSel] = useState({ r:0, c:0, r2:0, c2:0 });
+  const [editing, setEditingState] = useState(null); // { id, k, value }
+  const editRef = useRef(null); // mirrors editing so Enter + blur never commit twice
+  const setEditing = v => { editRef.current = typeof v === 'function' ? v(editRef.current) : v; setEditingState(editRef.current); };
+  // Undo batches, newest last. Each entry: { id, expect: fields the edit wrote, before: their old values }.
+  const [undoStack, setUndoStack] = useState([]);
+  const [widgets, setWidgets] = useState(() => { try { return { cleaner:false, day:false, hours:false, ...JSON.parse(localStorage.getItem('cf_table_widgets')||'{}') }; } catch(e){ return { cleaner:false, day:false, hours:false }; } });
+  const gridRef = useRef(null);
+  const day = DAYS[dayIdx];
+
+  const nameMap = useMemo(() => buildSupervisorCleanerNameMap(jobs), [jobs]);
+  const rows = useMemo(() => sortTableDayJobs(jobs.filter(j => j.day === day)), [jobs, day]);
+  const issuesOf = j => (conflicts && conflicts.get ? conflicts.get(j.id) : null) || [];
+
+  // Severity per cell: red = a real conflict (overlap, travel, late rest, availability, training,
+  // window), yellow = review only (missing people, gender/senior requirement, nobody assigned).
+  const cellIssue = (j, k) => {
+    const list = issuesOf(j);
+    if(k === 'cleaners'){
+      const red = list.find(x => isRealConflictIssue(x) && x.type !== 'window');
+      if(red) return { lvl:'bad', msg:red.msg };
+      if(dedupeCleanerIds(j.cleanerIds).length === 0) return { lvl:'warn', msg:'Turno da assegnare' };
+      const y = list.find(x => !isRealConflictIssue(x));
+      if(y) return { lvl:'warn', msg:y.msg };
+    }
+    if(k === 'start' || k === 'end'){
+      const w = list.find(x => x.type === 'window');
+      if(w) return { lvl:'bad', msg:w.msg };
+    }
+    return null;
+  };
+
+  const clampSel = (s, n) => {
+    const cl = v => Math.max(0, Math.min(v, Math.max(0, n - 1)));
+    const cc = v => Math.max(0, Math.min(v, TABLE_COLS.length - 1));
+    return { r:cl(s.r), c:cc(s.c), r2:cl(s.r2), c2:cc(s.c2) };
+  };
+  useEffect(() => { setSel(s => clampSel(s, rows.length)); }, [rows.length]);
+  useEffect(() => { try { localStorage.setItem('cf_table_widgets', JSON.stringify(widgets)); } catch(e){} }, [widgets]);
+  const focusGrid = () => { if(gridRef.current) gridRef.current.focus(); };
+  useEffect(() => { focusGrid(); }, []);
+  useEffect(() => { setUndoStack([]); }, [weekOffset]);
+
+  // ── applying an edit (validation mirrors JobForm) ──
+  const editText = (j, k) => {
+    const cells = tableRowCells(j, nameMap);
+    if(k === 'cleaners') return cells.cleaners.split('\n').join(' + ');
+    if(k === 'notes') return cells.notes;
+    return cells[k] || '';
+  };
+  const resolveCleaner = token => {
+    const t = token.trim().toLowerCase(); if(!t) return null;
+    const byLabel = Object.keys(nameMap).find(id => String(nameMap[id]).toLowerCase() === t);
+    if(byLabel) return CLEANERS.find(c => String(c.id) === String(byLabel)) || null;
+    const exact = CLEANERS.filter(c => String(c.name||'').trim().toLowerCase() === t);
+    if(exact.length === 1) return exact[0];
+    const pre = CLEANERS.filter(c => String(c.name||'').trim().toLowerCase().startsWith(t));
+    return pre.length === 1 ? pre[0] : null;
+  };
+  // Returns { patch, manual } or { error }.
+  const buildPatch = (j, k, raw) => {
+    const v = String(raw ?? '').trim();
+    const dutyS = getJobOperationalStartMinutes(j), dutyE = getJobOperationalEndMinutes(j);
+    const overridesFit = (startMin, endMin, overrides) => Object.keys(overrides || {}).every(id => {
+      const ov = overrides[id] || {};
+      const s = ov.startTime && isValidHHMM(ov.startTime) ? t2m(ov.startTime) : startMin;
+      const e = ov.endTime && isValidHHMM(ov.endTime) ? t2m(ov.endTime) : endMin;
+      return s >= startMin && e > s && e <= endMin;
+    });
+    if(k === 'notes'){
+      // The automatic Hostaway note (booking number, back-to-back window) is hidden here, as in
+      // the printout: replacing it needs an explicit yes.
+      if(v && /^Hostaway (checkout|check-in)/.test(String(j.note||'').trim()) &&
+         !window.confirm('Questo turno ha la nota automatica di Hostaway (numero di prenotazione, finestra del B2B), che nella tabella e nella stampa non si vede.\n\nSostituirla con la tua nota?')) return { cancel:true };
+      return { patch:{ note:v }, manual:false };
+    }
+    if(k === 'start'){
+      const t = tableNormTime(v); if(!t) return { error:`"${v}" non è un orario: scrivi per esempio 10:30` };
+      const next = { ...j, startTime:t };
+      if(j.manualEndTime && isValidHHMM(j.manualEndTime) && t2m(j.manualEndTime) <= t2m(t))
+        return { error:`La fine impostata (${j.manualEndTime}) è prima del nuovo inizio: cambia prima la fine` };
+      if(!overridesFit(t2m(t), getJobOperationalEndMinutes(next), j.cleanerTimeOverrides))
+        return { error:'Il nuovo orario esclude gli orari personali in Cleaners: cambia prima quelli' };
+      return { patch:{ startTime:t }, manual:true };
+    }
+    if(k === 'end'){
+      const t = tableNormTime(v); if(!t) return { error:`"${v}" non è un orario: scrivi per esempio 13:00` };
+      if(t2m(t) <= dutyS) return { error:'La fine deve essere dopo l\'inizio' };
+      const manualEndTime = t2m(t) === getJobDefaultEndMinutes(j) ? '' : t;
+      if(!overridesFit(dutyS, t2m(t), j.cleanerTimeOverrides))
+        return { error:'La nuova fine esclude gli orari personali in Cleaners: cambia prima quelli' };
+      return { patch:{ manualEndTime }, manual:true };
+    }
+    if(k === 'cleaners'){
+      const ids = [], overrides = {};
+      const tokens = v ? v.split(/\s*[+,;\n]\s*/).filter(Boolean) : [];
+      for(const tok of tokens){
+        const m = /^(.*?)\s+(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})$/.exec(tok.trim());
+        const name = m ? m[1] : tok;
+        const cl = resolveCleaner(name);
+        if(!cl) return { error:`Nel team non c'è nessuno (o c'è più di una persona) chiamato "${name.trim()}"` };
+        const id = String(cl.id);
+        if(ids.includes(id)) continue;
+        ids.push(id);
+        if(m){
+          const s = tableNormTime(m[2]), e = tableNormTime(m[3]);
+          if(!s || !e) return { error:`Orario di ${name.trim()} non valido` };
+          const wasHere = dedupeCleanerIds(j.cleanerIds).includes(id) && !(j.cleanerTimeOverrides || {})[id];
+          if(wasHere && s === tableClock(getCleanerOperationalStartMinutes(j, id)) && e === tableClock(getCleanerOperationalEndMinutes(j, id))) continue;
+          if(!(t2m(s) >= dutyS && t2m(e) > t2m(s) && t2m(e) <= dutyE))
+            return { error:`L'orario di ${name.trim()} deve stare dentro il turno (${tableClock(dutyS)}–${tableClock(dutyE)})` };
+          if(t2m(s) !== dutyS || t2m(e) !== dutyE) overrides[id] = { startTime:s, endTime:e };
+        }
+      }
+      return { patch:{ cleanerIds:ids, cleanerTimeOverrides:overrides }, manual:true };
+    }
+    return { error:'Questa colonna non si modifica dalla tabella' };
+  };
+  // Field comparison that treats empty values alike (undefined, null, '', {}).
+  const normField = v => {
+    if(v === undefined || v === null || v === '') return '';
+    if(typeof v === 'object' && !Array.isArray(v)) return Object.keys(v).length ? JSON.stringify(Object.keys(v).sort().reduce((o, key) => (o[key] = v[key], o), {})) : '';
+    return typeof v === 'object' ? JSON.stringify(v) : String(v);
+  };
+  const UNDO_EXTRA = ['earlyLeaveSuggestions']; // may be dropped by the edit (overridden person)
+  const makeEntry = (j, patch, manual) => {
+    const expect = { ...patch, ...(manual ? { manualEdited:true, schedulerDecisionCode:'manual_edit' } : {}) };
+    if(expect.cleanerIds) expect.cleanerIds = dedupeCleanerIds(expect.cleanerIds);
+    const before = {};
+    [...Object.keys(expect), ...UNDO_EXTRA].forEach(f => { before[f] = j[f] === undefined ? null : j[f]; });
+    return { id:j.id, expect, before };
+  };
+  const pushUndo = entries => { const list = entries.filter(Boolean); if(list.length) setUndoStack(st => [...st.slice(-99), list]); };
+  // Returns an undo entry, null when nothing changed (or the user cancelled), false on error.
+  const applyEdit = (j, k, raw) => {
+    if(String(raw ?? '').trim() === editText(j, k).trim()) return null;
+    const res = buildPatch(j, k, raw);
+    if(res.cancel) return null;
+    if(res.error){ showToast(res.error, 'error'); return false; }
+    if(Object.keys(res.patch).every(f => normField(j[f]) === normField(res.patch[f]))) return null; // same value retyped
+    const entry = makeEntry(j, res.patch, res.manual);
+    return onUpdateJob(j.id, res.patch, { manual:res.manual }) ? entry : null;
+  };
+  // Undo only restores the fields the table changed, and only if they still hold what the
+  // table wrote: a later change made elsewhere (JobForm, Hostaway, another device) is kept.
+  const undo = () => {
+    if(!undoStack.length) return;
+    const batch = undoStack[undoStack.length - 1];
+    setUndoStack(st => st.slice(0, -1));
+    let skipped = 0;
+    [...batch].reverse().forEach(en => {
+      const cur = jobs.find(x => x.id === en.id);
+      if(!cur || !Object.keys(en.expect).every(f => normField(cur[f]) === normField(en.expect[f]))){ skipped++; return; }
+      onUpdateJob(en.id, en.before, { manual:false });
+    });
+    if(skipped) showToast(skipped === batch.length ? 'Non posso annullare: nel frattempo il turno è stato cambiato da un\'altra parte' : `Annullato in parte: ${skipped} turni erano già stati cambiati da un'altra parte`, 'warn');
+  };
+
+  // ── selection & keyboard ──
+  const select = (r, c, extend) => {
+    setSel(s => clampSel(extend ? { ...s, r2:r, c2:c } : { r, c, r2:r, c2:c }, rows.length));
+  };
+  const move = (dr, dc, extend) => {
+    let r = sel.r2 + dr, c = sel.c2 + dc;
+    if(c > TABLE_COLS.length - 1){ c = 0; r++; } if(c < 0){ c = TABLE_COLS.length - 1; r--; }
+    select(Math.max(0, Math.min(r, rows.length - 1)), c, extend);
+  };
+  const startEdit = initial => {
+    const j = rows[sel.r2]; if(!j) return;
+    const col = TABLE_COLS[sel.c2];
+    if(col.ro){ showToast(col.k === 'guests' ? 'Gli ospiti arrivano da Hostaway' : `${col.label} non si modifica dalla tabella (usa la finestra del turno)`, 'warn'); return; }
+    setSel(s => ({ ...s, r:s.r2, c:s.c2 }));
+    setEditing({ id:j.id, k:col.k, value: initial !== undefined ? initial : editText(j, col.k) });
+  };
+  // Returns false when the value is invalid (the editor stays open), true otherwise.
+  const commitEdit = (dr, dc) => {
+    const ed = editRef.current;
+    if(!ed) return true;
+    const j = rows.find(x => x.id === ed.id);
+    const res = j ? applyEdit(j, ed.k, ed.value) : null;
+    if(res === false) return false;
+    pushUndo([res]);
+    setEditing(null);
+    setTimeout(() => { focusGrid(); if(dr || dc) move(dr, dc, false); }, 0);
+    return true;
+  };
+  const clearSelection = () => {
+    const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
+    let blocked = false; const entries = [];
+    for(let r = r1; r <= r2; r++) for(let c = c1; c <= c2; c++){
+      const j = rows[r], k = TABLE_COLS[c].k; if(!j) continue;
+      if(k === 'notes' || k === 'cleaners') entries.push(applyEdit(j, k, '')); else blocked = true;
+    }
+    pushUndo(entries);
+    if(blocked) showToast('Si possono svuotare solo Cleaners e Notes', 'warn');
+  };
+  const unlockSelection = () => {
+    const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2);
+    const picked = rows.slice(r1, r2 + 1).filter(isManualJob);
+    if(!picked.length){ showToast('Seleziona una riga con la M per sbloccarla', 'warn'); return; }
+    // Unlocking gives the whole duty back to Rigenera: the manual end and per-person hours
+    // go too (else the scheduler would plan around times nobody sees any more). A duty that
+    // stays protected (template, rescue split) keeps its hours, since Rigenera never
+    // recomputes it; rescueUsed / rescue_split are never touched.
+    const staysProtected = j => isLockedTemplateJob(j) || j.rescueUsed === true || j.schedulerDecisionCode === 'rescue_split';
+    const patchFor = j => ({ manualEdited:false,
+      schedulerDecisionCode: j.schedulerDecisionCode === 'manual_edit' ? '' : j.schedulerDecisionCode,
+      ...(staysProtected(j) ? {} : { manualEndTime:'', cleanerTimeOverrides:{} }) });
+    pushUndo(picked.map(j => { const p = patchFor(j); const en = makeEntry(j, p, false); return onUpdateJob(j.id, p, { manual:false }) ? en : null; }));
+    const stillProtected = picked.filter(staysProtected).length;
+    const freed = picked.length - stillProtected;
+    showToast((freed ? (freed === 1 ? 'Turno sbloccato, orari manuali tolti: Rigenera potrà ricalcolarlo' : `${freed} turni sbloccati, orari manuali tolti: Rigenera potrà ricalcolarli`) : 'M tolta')
+      + (stillProtected ? ` (${stillProtected === 1 ? 'uno resta protetto, con i suoi orari' : stillProtected + ' restano protetti, con i loro orari'}: da template o split di emergenza)` : ''));
+  };
+  const selectionTSV = () => {
+    const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
+    const out = [];
+    for(let r = r1; r <= r2; r++){ const j = rows[r]; if(!j) continue; const line = []; for(let c = c1; c <= c2; c++) line.push(editText(j, TABLE_COLS[c].k)); out.push(line.join('\t')); }
+    return out.join('\n');
+  };
+  const onGridKey = e => {
+    if(editing) return;
+    const mod = e.ctrlKey || e.metaKey;
+    if(mod && e.key.toLowerCase() === 'z'){ e.preventDefault(); undo(); return; }
+    if(mod) return;
+    switch(e.key){
+      case 'ArrowDown': e.preventDefault(); move(1, 0, e.shiftKey); return;
+      case 'ArrowUp': e.preventDefault(); move(-1, 0, e.shiftKey); return;
+      case 'ArrowRight': e.preventDefault(); move(0, 1, e.shiftKey); return;
+      case 'ArrowLeft': e.preventDefault(); move(0, -1, e.shiftKey); return;
+      case 'Tab': e.preventDefault(); move(0, e.shiftKey ? -1 : 1, false); return;
+      case 'Enter': e.preventDefault(); move(e.shiftKey ? -1 : 1, 0, false); return;
+      case 'F2': e.preventDefault(); startEdit(); return;
+      case 'Delete': case 'Backspace': e.preventDefault(); clearSelection(); return;
+      case 'Escape': return;
+    }
+    if(e.key.length === 1 && !e.altKey){ e.preventDefault(); startEdit(e.key); }
+  };
+  const onCopy = e => {
+    if(editing) return;
+    e.clipboardData.setData('text/plain', selectionTSV()); e.preventDefault();
+    showToast('Copiato: si può incollare anche in Excel');
+  };
+
+  // ── numbers ──
+  const dayStats = list => {
+    const unassigned = list.filter(j => dedupeCleanerIds(j.cleanerIds).length === 0).length;
+    const review = list.filter(j => dedupeCleanerIds(j.cleanerIds).length > 0 && calcJobStatus(j) === 'needs_review').length;
+    const hours = list.reduce((s, j) => s + dedupeCleanerIds(j.cleanerIds).reduce((t, id) => t + getCleanerEffectiveJobDuration(j, id), 0), 0);
+    return { unassigned, review, hours:Math.round(hours * 10) / 10 };
+  };
+  const team = useMemo(() => {
+    const per = {}; const perDay = DAYS.map(() => ({ shifts:0, unassigned:0, people:new Set(), hours:0 }));
+    jobs.forEach(j => {
+      const di = DAYS.indexOf(j.day); if(di < 0) return;
+      const ids = dedupeCleanerIds(j.cleanerIds);
+      perDay[di].shifts++; if(!ids.length) perDay[di].unassigned++;
+      ids.forEach(id => {
+        const h = getCleanerEffectiveJobDuration(j, id);
+        const p = per[id] || (per[id] = { shifts:Array(7).fill(0), hours:0, days:new Set() });
+        p.shifts[di]++; p.hours += h; p.days.add(di);
+        perDay[di].people.add(id); perDay[di].hours += h;
+      });
+    });
+    return { per, perDay };
+  }, [jobs]);
+  const cleanerName = id => { const c = CLEANERS.find(x => String(x.id) === String(id)); return nameMap[id] || (c ? c.name : id); };
+  const redCount = list => getRealConflictCount(list, conflicts);
+
+  // ── render ──
+  const st = dayStats(rows);
+  const r1 = Math.min(sel.r, sel.r2), r2 = Math.max(sel.r, sel.r2), c1 = Math.min(sel.c, sel.c2), c2 = Math.max(sel.c, sel.c2);
+  const date = dates[dayIdx];
+  const dayLabel = date ? `${DAY_EN[day]} ${date.getDate()} ${SUPERVISOR_MONTH_NAMES[date.getMonth()]} ${date.getFullYear()}` : DAY_EN[day];
+  const nWidgets = (widgets.cleaner?1:0) + (widgets.day?1:0) + (widgets.hours?1:0);
+  const sideW = nWidgets >= 2 ? 380 : 330;
+  const FONT = "Calibri, Carlito, 'Segoe UI', Arial, sans-serif";
+  const td = { border:'1px solid #D4D4D4', padding:'0 6px', height: nWidgets ? 23 : 26, whiteSpace:'nowrap', position:'relative', fontSize: nWidgets ? 12 : 13 };
+  const tb = { display:'inline-flex', alignItems:'center', gap:6, border:'1px solid #E3DCD3', background:'white', color:'#1B1916', borderRadius:9, padding:'6px 11px', fontSize:13, fontWeight:700, cursor:'pointer', fontFamily:'inherit', whiteSpace:'nowrap' };
+  const tbOn = { ...tb, background:'#F3E6DB', borderColor:'#A66A43' };
+  const box = { background:'white', border:'1px solid #E3DCD3', borderRadius:12, padding:'12px 14px' };
+  const h2 = { fontFamily:"'Syne',sans-serif", fontSize:14, fontWeight:800, margin:'0 0 8px' };
+  const mini = { width:'100%', borderCollapse:'collapse', fontSize:12.5, fontVariantNumeric:'tabular-nums' };
+  const toggle = k => setWidgets(w => ({ ...w, [k]:!w[k] }));
+
+  const dayIssues = [];
+  rows.forEach((j, r) => TABLE_COLS.forEach((c, ci) => { const is = cellIssue(j, c.k); if(is) dayIssues.push({ j, r, ci, ...is }); }));
+  dayIssues.sort((a, b) => (a.lvl === 'bad' ? 0 : 1) - (b.lvl === 'bad' ? 0 : 1));
+
+  return (
+    <div style={{position:'fixed',inset:0,zIndex:200,background:'#F5F2EE',display:'flex',flexDirection:'column',fontFamily:"'Nunito',sans-serif",color:'#1B1916'}}>
+      <div style={{background:'#0E0D0C',color:'#F7F3EC',padding:'10px 16px',display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+        <button onClick={onClose} style={{...tb,background:'transparent',color:'#F7F3EC',borderColor:'rgba(255,255,255,0.25)'}} title="Chiude la tabella e torna alla vista di prima">← Indietro</button>
+        <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:18}}>Tabella</div>
+        <div style={{fontSize:13,fontWeight:800,background:'rgba(255,255,255,0.08)',border:'1px solid rgba(255,255,255,0.14)',borderRadius:8,padding:'3px 10px'}}>{fmtWeek(weekOffset)}</div>
+        <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+          <span style={{fontSize:12.5,fontWeight:700,color:'#CFC6BC'}}>{publishLabel}</span>
+          <button onClick={onPrint} style={{...tb,background:'transparent',color:'#F7F3EC',borderColor:'rgba(255,255,255,0.25)'}} title="Scarica l'XLSX di sempre: 7 fogli, uno per giorno">🖨 Stampa settimana</button>
+          <button onClick={onPublish} disabled={publishBusy} style={{...tb,background:'#A66A43',color:'white',borderColor:'#A66A43',opacity:publishBusy?0.6:1}}>{publishBusy?'Pubblico…':'📤 Pubblica'}</button>
+          <button onClick={onMinimize} title="Riduci: la tabella resta com'è, la riapri dal pulsante in basso" style={{...tb,background:'transparent',color:'#F7F3EC',borderColor:'rgba(255,255,255,0.25)',padding:'6px 12px',fontSize:16,lineHeight:1}}>–</button>
+        </div>
+      </div>
+
+      <div style={{padding:'10px 16px',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+        <button style={{...tb,opacity:undoStack.length?1:0.45}} disabled={!undoStack.length} onClick={undo} title="Annulla l'ultima modifica (Ctrl+Z)">↶ Annulla</button>
+        <button style={tb} onClick={unlockSelection} title="Toglie la M e gli orari manuali (fine e orari personali): Rigenera potrà di nuovo ricalcolare il turno">🔓 Sblocca</button>
+        <span style={{width:1,height:22,background:'#E3DCD3',margin:'0 4px'}}/>
+        <span style={{fontSize:11,fontWeight:800,letterSpacing:'.06em',textTransform:'uppercase',color:'#6E655C'}}>Riepiloghi</span>
+        <button style={widgets.cleaner?tbOn:tb} onClick={()=>toggle('cleaner')}>👥 Turni per cleaner</button>
+        <button style={widgets.day?tbOn:tb} onClick={()=>toggle('day')}>📅 Turni per giorno</button>
+        <button style={widgets.hours?tbOn:tb} onClick={()=>toggle('hours')}>⏱ Ore totali</button>
+        <span style={{marginLeft:'auto',fontSize:12,color:'#6E655C'}}>Scrivi per modificare · F2 o doppio clic · Invio/Tab · Esc · Canc · Ctrl+C · Ctrl+Z</span>
+      </div>
+
+      <div style={{flex:1,minHeight:0,display:'grid',gridTemplateColumns:`minmax(0,1fr) ${sideW}px`,gridTemplateRows:'minmax(0,1fr)',gap:14,padding:'0 16px 14px'}}>
+        <div style={{minWidth:0,display:'flex',flexDirection:'column',minHeight:0,height:'100%'}}>
+          <div ref={gridRef} tabIndex={0} onKeyDown={onGridKey} onCopy={onCopy} style={{flex:1,minHeight:0,overflow:'auto',background:'white',border:'1px solid #E3DCD3',borderRadius:'12px 12px 0 0',outline:'none'}}>
+            <table style={{borderCollapse:'collapse',fontFamily:FONT,color:'#1D1D1D',minWidth:'100%',fontVariantNumeric:'tabular-nums',userSelect:'none'}}>
+              <colgroup><col style={{width:46}}/><col style={{width:62}}/><col style={{width:62}}/><col style={{width:200}}/><col style={{width:100}}/><col style={{width:104}}/><col style={{width:240}}/><col style={{minWidth:180}}/></colgroup>
+              <tbody>
+                <tr><td style={{...td,background:'#F2F2F2'}}/>{TABLE_COLS.map((c,i)=><td key={i} style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11,height:20}}>{'ABCDEFG'[i]}</td>)}</tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>1</td><td colSpan={7} style={{...td,border:'none',fontSize:16,fontWeight:700,height:30}}>CleanFlow Supervisor Schedule</td></tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>2</td><td colSpan={7} style={{...td,border:'none',fontWeight:700}}>{dayLabel}</td></tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>3</td><td colSpan={7} style={{...td,border:'none',borderBottom:'1px solid #D4D4D4',color:'#444',whiteSpace:'pre'}}>{`Jobs: ${rows.length}    Unassigned: ${st.unassigned}    Needs review: ${st.review}    Total hours: ${st.hours}`}</td></tr>
+                <tr><td style={{...td,background:'#F2F2F2',color:'#7A7A7A',textAlign:'center',fontSize:11}}>4</td>{TABLE_COLS.map(c=><td key={c.k} style={{...td,fontWeight:700}}>{c.label}</td>)}</tr>
+                {rows.map((j, r) => {
+                  const cells = tableRowCells(j, nameMap);
+                  const fillHex = getSupervisorJobFillColor(j);
+                  const fill = fillHex ? '#' + fillHex : 'white';
+                  const rowSel = r >= r1 && r <= r2;
+                  const mk = isManualJob(j) ? { t:'M', bg:'#2F6FDE', tip:'Orari o persone cambiati a mano: Rigenera non lo tocca. Seleziona la riga e premi Sblocca per ridarlo a Rigenera' }
+                    : isLockedTemplateJob(j) ? { t:'T', bg:'#7A5233', tip:'Da template: Rigenera non lo tocca' } : null;
+                  return (
+                    <tr key={j.id}>
+                      <td onMouseDown={e=>{e.preventDefault(); if(!commitEdit(0,0)) return; select(r, 0, false); setSel({ r, c:0, r2:r, c2:TABLE_COLS.length-1 }); focusGrid();}}
+                        style={{...td,background:rowSel?'#DCE6F8':'#F2F2F2',color:rowSel?'#2F6FDE':'#7A7A7A',textAlign:'center',fontSize:11,cursor:'pointer'}}>
+                        {r + 5}{mk&&<span title={mk.tip} style={{marginLeft:3,background:mk.bg,color:'white',borderRadius:3,padding:'0 3px',fontSize:9,fontWeight:800}}>{mk.t}</span>}
+                      </td>
+                      {TABLE_COLS.map((c, ci) => {
+                        const is = cellIssue(j, c.k);
+                        const isCur = r === sel.r2 && ci === sel.c2;
+                        const inSel = rowSel && ci >= c1 && ci <= c2;
+                        const isEd = editing && editing.id === j.id && editing.k === c.k;
+                        const txt = cells[c.k];
+                        const empty = c.k === 'cleaners' && !txt;
+                        let shadow = is ? (is.lvl === 'bad' ? 'inset 0 0 0 2px #C8323C' : 'inset 0 0 0 2px #E29A00') : 'none';
+                        if(isCur) shadow = 'inset 0 0 0 2px #2F6FDE';
+                        const bg = is ? (is.lvl === 'bad' ? '#F8C9CD' : '#FFE2A8') : fill;
+                        return (
+                          <td key={c.k} title={is ? is.msg : (c.ro ? (c.k==='guests'?'Da Hostaway':'Non modificabile dalla tabella') : '')}
+                            onMouseDown={e=>{ if(isEd) return; e.preventDefault(); if(!commitEdit(0,0)) return; select(r, ci, e.shiftKey); focusGrid(); }}
+                            onDoubleClick={()=>{ select(r, ci, false); setTimeout(()=>startEdit(),0); }}
+                            style={{...td,background:bg,backgroundImage:inSel?'linear-gradient(rgba(47,111,222,.13),rgba(47,111,222,.13))':'none',boxShadow:shadow,
+                              color: c.ro ? '#555' : (empty ? '#9A6B00' : '#1D1D1D'), fontStyle: empty ? 'italic' : 'normal',
+                              whiteSpace: String(txt).includes('\n') ? 'pre' : 'nowrap', lineHeight: String(txt).includes('\n') ? 1.25 : 'normal', cursor:'cell'}}>
+                            {isEd ? (
+                              <input autoFocus value={editing.value} onChange={e=>setEditing(ed=>({...ed,value:e.target.value}))}
+                                onKeyDown={e=>{ if(e.key==='Enter'){e.preventDefault();commitEdit(e.shiftKey?-1:1,0);} else if(e.key==='Tab'){e.preventDefault();commitEdit(0,e.shiftKey?-1:1);} else if(e.key==='Escape'){e.preventDefault();setEditing(null);setTimeout(focusGrid,0);} }}
+                                onBlur={()=>commitEdit(0,0)}
+                                list={c.k==='cleaners'?'cf-table-cleaners':undefined}
+                                style={{position:'absolute',inset:0,width:'100%',minWidth:140,height:'100%',border:'2px solid #2F6FDE',font:'inherit',padding:'0 5px',background:'white',color:'#1D1D1D',outline:'none',zIndex:2}}/>
+                            ) : (empty ? 'da assegnare' : txt)}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <datalist id="cf-table-cleaners">{CLEANERS.map(c=><option key={c.id} value={nameMap[c.id]||c.name}/>)}</datalist>
+          </div>
+          <div style={{display:'flex',gap:2,overflowX:'auto',background:'#F2F2F2',border:'1px solid #E3DCD3',borderTop:0,borderRadius:'0 0 12px 12px',padding:'0 6px 6px'}}>
+            {DAYS.map((d, i) => {
+              const list = jobs.filter(j => j.day === d); const bad = redCount(list);
+              const on = i === dayIdx;
+              return (
+                <button key={d} onClick={()=>{ if(!commitEdit(0,0)) return; setDayIdx(i); setSel({r:0,c:0,r2:0,c2:0}); setTimeout(focusGrid,0); }}
+                  style={{font:`600 12px ${FONT}`,border:'1px solid #D4D4D4',borderTop:0,background:on?'white':'#E9E9E9',color:on?'#1D6B3A':'#444',fontWeight:on?700:600,padding:'6px 14px',borderRadius:'0 0 6px 6px',cursor:'pointer',display:'flex',gap:6,alignItems:'center',boxShadow:on?'inset 0 -3px 0 #21A366':'none',whiteSpace:'nowrap'}}>
+                  {DAY_EN[d]}<span style={{color:'#888',fontWeight:400}}>{list.length}</span>
+                  {bad>0&&<span style={{minWidth:16,height:16,borderRadius:8,background:'#C8323C',color:'white',fontSize:10,lineHeight:'16px',padding:'0 4px',fontWeight:700}}>{bad}</span>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{minHeight:0,height:'100%',overflow:'auto',display:'grid',gap:12,alignContent:'start'}}>
+          {widgets.cleaner&&<div style={box}>
+            <div style={{display:'flex'}}><div style={h2}>Turni per cleaner</div><button onClick={()=>toggle('cleaner')} style={{marginLeft:'auto',border:'none',background:'none',cursor:'pointer',color:'#6E655C',fontSize:16}}>×</button></div>
+            <div style={{fontSize:11.5,color:'#6E655C',margin:'-4px 0 6px'}}>Clic su un nome per la sua settimana</div>
+            <table style={mini}><thead><tr><th style={{textAlign:'left',fontSize:10.5,color:'#6E655C'}}>Cleaner</th>{DAYS.map((d,i)=><th key={d} style={{fontSize:10.5,color:'#6E655C',background:i===dayIdx?'#E3ECFB':'none'}}>{DAY_IT[d].charAt(0)}</th>)}<th style={{fontSize:10.5,color:'#6E655C'}}>Turni</th><th style={{fontSize:10.5,color:'#6E655C'}}>Gg</th></tr></thead>
+              <tbody>{Object.keys(team.per).sort((a,b)=>team.per[b].shifts.reduce((s,x)=>s+x,0)-team.per[a].shifts.reduce((s,x)=>s+x,0)).map(id=>{
+                const p = team.per[id]; const cl = CLEANERS.find(x=>String(x.id)===String(id)); const max = cl ? getEffectiveMaxWorkedDays(cl) : 7;
+                return (<tr key={id} onClick={()=>onOpenCleaner(id)} style={{cursor:'pointer',borderBottom:'1px solid #EEE'}}>
+                  <td style={{padding:'3px 2px'}}>{cleanerName(id)}</td>
+                  {p.shifts.map((n,i)=><td key={i} style={{textAlign:'center',color:n?'#1B1916':'#CCC',background:i===dayIdx?'#E3ECFB':'none'}}>{n||'·'}</td>)}
+                  <td style={{textAlign:'center',fontWeight:800}}>{p.shifts.reduce((s,x)=>s+x,0)}</td>
+                  <td style={{textAlign:'center',fontWeight:p.days.size>max?800:400,color:p.days.size>max?'#A35F00':'#1B1916'}} title={p.days.size>max?`Oltre il limite di ${max} giorni`:''}>{p.days.size}</td>
+                </tr>);})}</tbody></table>
+          </div>}
+          {widgets.day&&<div style={box}>
+            <div style={{display:'flex'}}><div style={h2}>Turni per giorno</div><button onClick={()=>toggle('day')} style={{marginLeft:'auto',border:'none',background:'none',cursor:'pointer',color:'#6E655C',fontSize:16}}>×</button></div>
+            <table style={mini}><thead><tr>{['Giorno','Turni','Da ass.','Persone','Ore'].map(h=><th key={h} style={{fontSize:10.5,color:'#6E655C',textAlign:h==='Giorno'||h==='Ore'?'left':'center'}}>{h}</th>)}</tr></thead>
+              <tbody>{team.perDay.map((d,i)=>{ const maxH = Math.max(1,...team.perDay.map(x=>x.hours)); return (
+                <tr key={i} onClick={()=>{setDayIdx(i);setSel({r:0,c:0,r2:0,c2:0});}} style={{cursor:'pointer',background:i===dayIdx?'#F3E6DB':'none',borderBottom:'1px solid #EEE'}}>
+                  <td style={{padding:'3px 2px'}}>{DAY_IT[DAYS[i]]} {dates[i]?dates[i].getDate():''}</td><td style={{textAlign:'center'}}>{d.shifts}</td>
+                  <td style={{textAlign:'center',color:d.unassigned?'#A35F00':'#CCC',fontWeight:d.unassigned?800:400}}>{d.unassigned||'·'}</td><td style={{textAlign:'center'}}>{d.people.size}</td>
+                  <td style={{whiteSpace:'nowrap'}}><span style={{display:'inline-block',height:8,width:Math.round(d.hours/maxH*56),background:'#C9A184',borderRadius:4,marginRight:4}}/>{Math.round(d.hours*10)/10}</td>
+                </tr>);})}</tbody></table>
+          </div>}
+          {widgets.hours&&<div style={box}>
+            <div style={{display:'flex'}}><div style={h2}>Ore totali</div><button onClick={()=>toggle('hours')} style={{marginLeft:'auto',border:'none',background:'none',cursor:'pointer',color:'#6E655C',fontSize:16}}>×</button></div>
+            <div style={{display:'grid',gap:4}}>{(()=>{ const ids = Object.keys(team.per).sort((a,b)=>team.per[b].hours-team.per[a].hours); const max = Math.max(1,...ids.map(id=>team.per[id].hours));
+              return ids.map(id=>(<div key={id} onClick={()=>onOpenCleaner(id)} style={{display:'grid',gridTemplateColumns:'80px 1fr 70px',gap:8,alignItems:'center',fontSize:12.5,cursor:'pointer'}}>
+                <span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{cleanerName(id)}</span>
+                <span style={{height:10,background:'#F2EEE9',borderRadius:5,overflow:'hidden'}}><span style={{display:'block',height:'100%',width:`${(team.per[id].hours/max*100).toFixed(1)}%`,background:'#C9A184',borderRadius:5}}/></span>
+                <span style={{textAlign:'right',fontWeight:700}}>{Math.round(team.per[id].hours*10)/10} h <span style={{color:'#6E655C',fontWeight:600}}>{team.per[id].days.size} gg</span></span>
+              </div>)); })()}</div>
+          </div>}
+          <div style={box}>
+            <div style={h2}>Da controllare · {DAY_IT[day]}</div>
+            {dayIssues.length ? <div style={{display:'grid',gap:5,maxHeight:300,overflow:'auto'}}>{dayIssues.map((x,i)=>(
+              <button key={i} onClick={()=>{select(x.r,x.ci,false);focusGrid();}} style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:8,textAlign:'left',background:'#F8F5F1',border:'1px solid transparent',borderRadius:8,padding:'6px 8px',cursor:'pointer',fontFamily:'inherit',fontSize:12.5,color:'#1B1916'}}>
+                <span style={{marginTop:4,width:8,height:8,borderRadius:'50%',background:x.lvl==='bad'?'#C8323C':'#E29A00'}}/>
+                <span><b>{getJobDisplayName(x.j)}</b> {tableRowCells(x.j,nameMap).start}<span style={{display:'block',color:'#6E655C',fontSize:11.5}}>{x.msg}</span></span>
+              </button>))}</div> : <div style={{color:'#2E7D4F',fontWeight:800,fontSize:13}}>✓ {DAY_EN[day]}: tutto a posto</div>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// One person's week as plain text, in the order shifts are typed into When I Work
+// (one line per day; per-person hours when they differ from the shift).
+const buildCleanerWeekText = (cleanerId, jobs, weekOffset) => {
+  const id = String(cleanerId);
+  const cl = CLEANERS.find(c => String(c.id) === id);
+  const dates = getWeekDates(weekOffset);
+  const lines = [`${cl ? cl.name : id} · settimana ${fmtWeek(weekOffset)}`];
+  DAYS.forEach((d, i) => {
+    const mine = (jobs||[]).filter(j => j.day === d && dedupeCleanerIds(j.cleanerIds).includes(id))
+      .sort((a, b) => getCleanerOperationalStartMinutes(a, id) - getCleanerOperationalStartMinutes(b, id));
+    const date = dates[i] ? `${String(dates[i].getDate()).padStart(2,'0')}/${String(dates[i].getMonth()+1).padStart(2,'0')}` : '';
+    lines.push(`${DAY_IT[d]} ${date}: ` + (mine.length
+      ? mine.map(j => `${tableClock(getCleanerOperationalStartMinutes(j, id))}-${tableClock(getCleanerOperationalEndMinutes(j, id))} ${getJobDisplayName(j)} (${getSupervisorServiceLabel(j.serviceTypeId, j.type)})`).join('; ')
+      : 'libera'));
+  });
+  return lines.join('\n');
+};
+// (copyTextToClipboard: the app already has one, reused here.)
+
 function Modal({children,onClose}){
   return(
     <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:300,display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
       <div style={{background:C.card,borderRadius:'22px 22px 0 0',padding:'8px 24px 36px',width:'100%',maxWidth:600,maxHeight:'93vh',overflowY:'auto'}}>
         <div style={{width:40,height:4,background:'#DDD',borderRadius:2,margin:'12px auto 20px'}}/>
-        {children}
+        <ViewBoundary name="finestra">{children}</ViewBoundary>
       </div>
     </div>
   );
@@ -9927,7 +10680,7 @@ const StatPill=({label,value,color,onClick})=>(
 // unpublished-week (no published snapshot but local jobs exist).
 // issueCount uses a real union: jobs that are either in conflict OR needs_review.
 function PublishedScheduleBanner({
-  publishedStatus, publishedJobsSnapshot, dirty, draftRestored, publishing,
+  publishedStatus, publishedJobsSnapshot, dirty, draftRestored, publishing, serverVersionChanged=false,
   jobs, conflicts, weekMismatchActive,
   onPublish, onDiscard, compact=false,
 }){
@@ -9986,6 +10739,7 @@ function PublishedScheduleBanner({
                 {!compact && <span style={{color:'#B45309'}}>— pubblica per renderle visibili su altri dispositivi.</span>}
                 {issueBadge(issueCount)}
                 {draftRestored && <span style={{marginLeft:6,padding:'1px 8px',borderRadius:6,background:'#FEF3C7',color:'#92400E',fontWeight:700}}>📝 Bozza locale ripristinata</span>}
+                {serverVersionChanged && <span title="Quando pubblichi vedrai cosa cambia rispetto alla versione pubblicata" style={{marginLeft:6,padding:'1px 8px',borderRadius:6,background:'#FEE2E2',color:'#991B1B',fontWeight:700}}>⚠ C'è una versione pubblicata più recente{publishedJobsSnapshot.meta.publishedBy?` (${publishedJobsSnapshot.meta.publishedBy})`:''}</span>}
               </>
             ) : (
               <>
@@ -10161,11 +10915,9 @@ function HostawayModal({onImport,onClose,weekOffset=0}){
     try{
       const startDate=getWeekStartISO(weekOffset);
       const endDate=getWeekEndISO(weekOffset);
-      const url=`${PUBLISHED_API_URL}?action=hostawayReservations&startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`;
-      const res=await fetch(url,{redirect:'follow'});
-      const data=await res.json();
+      const data=await cfApi('cfHostawayReservations',{startDate,endDate},{timeoutMs:120000});
       if(!data||data.ok!==true){
-        setApiError('Errore API: '+((data&&data.error)||('HTTP '+res.status))+(data&&data.stage?` (${data.stage})`:''));
+        setApiError('Errore API: '+((data&&data.error)||'risposta non valida')+(data&&data.stage?` (${data.stage})`:''));
         setApiLoading(false);
         return;
       }
@@ -11743,7 +12495,7 @@ function WIWExportModal({jobs,weekOffset,wf,conflicts,showToast,planningWeekOffs
 
 // ── DESKTOP SIDEBAR ────────────────────────────────────────────────────────────
 function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conflicts,onGenerate,onConflictDay,setModal,dataReady,genGate,refreshSheetData,sheetLoading,onLastMinute,supervisorName,onChangeSupervisorName,onPublish,publishing,publishedStatus,weekMismatchActive,showToast}){
-  const NAV=[{id:'week',icon:'📅',label:'Settimana'},{id:'day',icon:'📋',label:'Giorno'},{id:'props',icon:'🏢',label:'Proprietà'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI Chat'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(CLEANFLOW_DEBUG_CENTER_ENABLED?[{id:'debug',icon:'🧪',label:'Debug Center'}]:[])];
+  const NAV=[{id:'week',icon:'📅',label:'Settimana'},{id:'day',icon:'📋',label:'Giorno'},{id:'props',icon:'🏢',label:'Proprietà'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI Chat'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},{id:'table',icon:'📊',label:'Tabella'},...(canSeeDebug()?[{id:'debug',icon:'🧪',label:'Debug Center'}]:[])];
   const unassigned=jobs.filter(j=>j.cleanerIds.length===0).length;
   // Same real-conflict taxonomy as WeekView (staffing/gender excluded) — shared
   // helpers defined near detectConflicts() so the two never drift apart.
@@ -11839,7 +12591,8 @@ function Sidebar({tab,setTab,selDay,weekOffset,setWeekOffset,wf,totalC,jobs,conf
         </button>
         <div style={{display:'flex',alignItems:'center',gap:6,fontSize:11,color:'#9FB6CC',marginTop:2}}>
           <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>👤 Supervisor: {supervisorName||'non impostato'}</span>
-          <button onClick={onChangeSupervisorName} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Cambia</button>
+          <button onClick={()=>setModal('changePassword')} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Password</button>
+          <button onClick={onChangeSupervisorName} style={{background:'rgba(255,255,255,0.1)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 9px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Esci</button>
         </div>
       </div>
     </div>
@@ -12790,12 +13543,12 @@ function App(){
       }
     });
   },[jobs]);
-  // Initial view. ?view=debug is honoured ONLY when the Debug Center flag is on;
-  // with the flag off the parameter is ignored and the normal initial view loads.
+  // Initial view. ?view=debug is honoured ONLY for the owner (superadmin session)
+  // with the Debug Center flag on; otherwise the normal initial view loads.
   // Deliberate scope choice: the URL is READ once at mount and never rewritten on
   // internal navigation, so refresh / back button / existing query strings are untouched.
   const [tab,          setTab         ]=useState(()=>{
-    if(CLEANFLOW_DEBUG_CENTER_ENABLED){
+    if(canSeeDebug()){
       try{ if(new URLSearchParams(window.location.search).get('view')==='debug') return 'debug'; }
       catch(e){ /* URL not parseable — fall back to the normal initial view */ }
     }
@@ -12819,9 +13572,20 @@ function App(){
   const [aiLoad,       setAiLoad      ]=useState(false);
   const [toast,        setToast       ]=useState(null);
   const [apiKeyInput,  setApiKeyInput ]=useState('');
-  const [authed,       setAuthed      ]=useState(()=>sessionStorage.getItem('cf_auth')==='1');
+  // Real login (server-side). An unexpired stored session opens the app directly;
+  // the server still validates the token on every call.
+  const [authed,       setAuthed      ]=useState(()=>!!getSession());
+  const [loginUser,    setLoginUser   ]=useState(()=>getLastUsername());
   const [pwInput,      setPwInput     ]=useState('');
-  const [pwError,      setPwError     ]=useState(false);
+  const [pwError,      setPwError     ]=useState('');
+  const [loggingIn,    setLoggingIn   ]=useState(false);
+  const [authLost,     setAuthLost    ]=useState(null); // set when the server rejects the session mid-use
+  const [authEpoch,    setAuthEpoch   ]=useState(0);    // bumped on every login: refetches the published week
+  const [hostawayReport, setHostawayReport]=useState(null); // result of a merged Hostaway re-import
+  useEffect(()=>{ setHostawayReport(null); },[weekOffset]);
+  // Provisional (owner-set) password: must be replaced before using the app.
+  const [mustChangePw, setMustChangePw]=useState(()=>!!(((getSession()||{}).user||{}).mustChangePassword));
+  const provisionalPwRef=useRef(''); // the password just typed at login, in memory only
   const [sheetStatus,  setSheetStatus ]=useState('loading'); // 'loading'|'ok'|'warn'|'error'
   const [sheetLoading, setSheetLoading]=useState(false);
   const dataReady = sheetStatus==='ok';
@@ -12865,16 +13629,40 @@ function App(){
   // Set true after a publish conflict + snapshot refetch. Makes the NEXT publish
   // confirm carry a strong "you are overwriting a newer version" warning.
   const [serverVersionChanged, setServerVersionChanged]=useState(false);
-  // Supervisor name surfaced in UI (label + Cambia action). Mirrors localStorage.
-  const [supervisorNameUI, setSupervisorNameUI]=useState(()=>getSupervisorName());
-  const changeSupervisorName = () => {
-    const entered = prompt('Il tuo nome supervisor:', supervisorNameUI||'');
-    if(entered===null) return;            // cancelled → keep existing
-    const trimmed = entered.trim();
-    if(!trimmed) return;                   // empty → keep existing
-    setSupervisorName(trimmed);
-    setSupervisorNameUI(trimmed);
+  // Supervisor shown in the UI = the logged-in user (the server sets "pubblicato da").
+  const [supervisorNameUI, setSupervisorNameUI]=useState(()=>((getSession()||{}).user||{}).displayName || getSupervisorName());
+  const doLogin = async () => {
+    if(loggingIn) return;
+    const username = loginUser.trim(), password = pwInput;
+    if(!username || !password){ setPwError('Inserisci nome utente e password'); return; }
+    setLoggingIn(true); setPwError('');
+    const r = await cfApi('cfLogin', { username, password });
+    setLoggingIn(false);
+    if(!r || r.ok!==true || !r.token){ setPwError((r&&r.error)||'Accesso non riuscito'); return; }
+    saveSession({ token:r.token, user:r.user, expiresAt:r.expiresAt });
+    const mustChange = !!(r.user && r.user.mustChangePassword);
+    provisionalPwRef.current = mustChange ? password : '';
+    setMustChangePw(mustChange);
+    setSupervisorName(r.user.displayName);
+    setSupervisorNameUI(r.user.displayName);
+    setPwInput('');
+    setAuthLost(null);
+    setAuthEpoch(e=>e+1);
+    setAuthed(true);
   };
+  const doLogout = async () => {
+    if(!confirm('Vuoi uscire da CleanFlow su questo dispositivo?')) return;
+    await cfApi('cfLogout', {});
+    clearSession();
+    window.location.reload(); // drop everything held in memory (shared devices)
+  };
+  // The server rejected the session mid-use: show the login again. App state (the
+  // week in progress) is kept, because `authed` does not change.
+  useEffect(()=>{
+    __cfOnAuthLost = (msg) => setAuthLost(msg || 'Sessione scaduta: accedi di nuovo.');
+    __cfOnMustChange = () => setMustChangePw(true);
+    return ()=>{ __cfOnAuthLost = null; __cfOnMustChange = null; };
+  },[]);
   // Initial-load guard: don't autosave during the first published+draft decision
   const initialLoadDoneRef = useRef(false);
   const publishingRef = useRef(false);
@@ -12888,6 +13676,13 @@ function App(){
   useEffect(()=>{ planningWeekOffsetRef.current=planningWeekOffset; },[planningWeekOffset]);
   const width=useWindowWidth();
   const isDesktop=width>=DESKTOP_BP;
+  // Tabella (desktop only). It stays mounted while minimised, so day, selection and undo survive.
+  const [tableMounted,setTableMounted]=useState(false);
+  const tableBackTabRef=useRef('week');
+  useEffect(()=>{
+    if(tab==='table'){ if(!isDesktop){ setTab(tableBackTabRef.current||'week'); return; } setTableMounted(true); }
+    else tableBackTabRef.current=tab;
+  },[tab,isDesktop]);
 
   // ── Load Google Sheet data — only after login ────────────────────────────
   useEffect(()=>{
@@ -13033,7 +13828,27 @@ function App(){
           && draft.basePublishedAt === result.publishedAt
           && draft.savedAt && result.publishedAt
           && draft.savedAt > result.publishedAt;
-        if(draftIsValid || (pendingOverwrite && draftHasJobs)){
+        // A draft on an OLDER publish that still differs from the server holds work a newer
+        // publish (another device or supervisor, e.g. while this session was logged out)
+        // never saw: keep it as a conflict (the next publish shows the overwrite diff) instead
+        // of replacing it without a word. A draft identical to the server (a publish whose
+        // reply was lost, or edits undone) has nothing left to protect and is cleared below.
+        const draftDiffers = draftHasJobs && normalizeJobsForCompare(draft.jobs) !== normalizeJobsForCompare(result.jobs);
+        const draftOnOlderBase = draftDiffers && !!draft.basePublishedAt && !!result.publishedAt
+          && draft.basePublishedAt !== result.publishedAt;
+        if(pendingOverwrite && draftHasJobs && !draftDiffers){
+          clearPendingOverwriteWarning(weekStartISO);
+          setServerVersionChanged(false);
+        }
+        if(draftOnOlderBase && !pendingOverwrite){
+          markPendingOverwriteWarning(weekStartISO);
+          setServerVersionChanged(true);
+          const me = ((getSession()||{}).user||{}).displayName;
+          const who = !result.publishedBy ? 'un altro supervisor' : (result.publishedBy === me ? 'tu, da un altro dispositivo,' : result.publishedBy);
+          const when = new Date(result.publishedAt).toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit'});
+          showToast(`Nel frattempo ${who} ha pubblicato questa settimana (${when}): tengo le tue modifiche non pubblicate. Quando pubblichi vedrai le differenze.`, 'warn');
+        }
+        if(draftIsValid || ((pendingOverwrite && draftDiffers) || draftOnOlderBase)){
           const cleanDraft = cleanRestoredJobs(draft.jobs, 'draft published week');
           console.log('[CleanFlow restore path]','draft published week',{before:draft.jobs.length,after:cleanDraft.length});
           setJobs(prev=>{
@@ -13097,7 +13912,7 @@ function App(){
       setTimeout(()=>{ if(!cancelled) initialLoadDoneRef.current = true; }, 0);
     });
     return ()=>{ cancelled=true; };
-  },[authed,weekOffset]);
+  },[authed,weekOffset,authEpoch]);
 
   const conflicts=useMemo(()=>detectConflicts(jobs),[jobs,dataVersion]);
   const totalC=conflicts.size;
@@ -13115,17 +13930,28 @@ function App(){
     if(weekMismatchActive) return;
     const weekStartISO = getWeekStartISO(weekOffset);
     if(publishedJobsSnapshot){
-      if(!dirty) return;
+      if(!dirty){
+        // Back to exactly the published plan (edits undone, or a publish whose reply was
+        // lost): a leftover draft would come back later as if it were unpublished work.
+        if(loadDraft(weekStartISO)) clearDraft(weekStartISO);
+        if(hasPendingOverwriteWarning(weekStartISO)){ clearPendingOverwriteWarning(weekStartISO); setServerVersionChanged(false); }
+        return;
+      }
       const basePublishedAt = publishedJobsSnapshot.meta.publishedAt;
       const handle = setTimeout(()=>{ saveDraft(weekStartISO, jobs, basePublishedAt); }, 400);
       return ()=>clearTimeout(handle);
     } else {
       const hasLocalWork = jobs.some(j=>j.source!=='last_minute');
       if(!hasLocalWork) return;
-      const handle = setTimeout(()=>{ saveDraft(weekStartISO, jobs, null); }, 400);
+      // Server state unknown (load failed: offline, session lost): keep the base of an
+      // existing draft so a draft tied to a published snapshot is not downgraded to
+      // local-only (the next successful load would discard it).
+      const existingDraft = publishedStatus==='error' ? loadDraft(weekStartISO) : null;
+      const keepBase = existingDraft && existingDraft.basePublishedAt ? existingDraft.basePublishedAt : null;
+      const handle = setTimeout(()=>{ saveDraft(weekStartISO, jobs, keepBase); }, 400);
       return ()=>clearTimeout(handle);
     }
-  },[jobs, dirty, publishedJobsSnapshot, weekMismatchActive, authed, weekOffset]);
+  },[jobs, dirty, publishedJobsSnapshot, weekMismatchActive, authed, weekOffset, publishedStatus]);
 
   useEffect(()=>{
     if(!dirty || !publishedJobsSnapshot) return;
@@ -13210,7 +14036,7 @@ function App(){
       return;
     }
 
-    let supervisorName = getSupervisorName();
+    let supervisorName = ((getSession()||{}).user||{}).displayName || getSupervisorName();
     if(!supervisorName){
       const entered = prompt('Il tuo nome supervisor (apparirà sul piano pubblicato):', '');
       supervisorName = (entered||'').trim();
@@ -13293,7 +14119,7 @@ function App(){
     const meta = {
       snapshotId: result.snapshotId,
       publishedAt: result.publishedAt,
-      publishedBy: supervisorName,
+      publishedBy: result.publishedBy || supervisorName,
       weekStartISO: result.weekStartISO,
       weekEndISO: result.weekEndISO,
     };
@@ -13702,6 +14528,42 @@ function App(){
       source: importSource,
       status:'unassigned'
     }));
+    const srcLabel = importSource==='hostaway_api' ? 'Hostaway API' : 'CSV';
+
+    // Re-import of a week that already has duties from this same source: merge into the
+    // plan instead of replacing it (people and manual changes survive). See
+    // mergeHostawayImportJobs. The first import and an API<->CSV switch replace, as before.
+    const sameInWeek = jobs.filter(j=>j.source===importSource && inWeek(j.dateISO));
+    if(otherInWeek.length===0 && sameInWeek.length>0){
+      const { jobs:merged, report } = mergeHostawayImportJobs(jobs, rows, { inWeek, importSource, makeId:uid });
+      // Rows of other weeks (a CSV can span weeks): same dedup as the replace path below.
+      const isHostawaySrc = j => j.source==='hostaway_api' || j.source==='hostaway_csv';
+      const otherWeekNew = incoming.filter(nj => !inWeek(nj.dateISO) && !merged.some(e => isHostawaySrc(e) && e.dateISO===nj.dateISO && e.propertyId===nj.propertyId && e.startTime===nj.startTime));
+      setJobs(otherWeekNew.length ? [...merged, ...otherWeekNew] : merged); // also carries silent refreshes (data the sheet does not keep)
+      if(planningWeekOffset===null) setPlanningWeekOffset(weekOffset);
+      setModal(null);
+      if(!report.hasNews){
+        setHostawayReport(null);
+        showToast('Nessun nuovo dato da importare: la settimana è già aggiornata');
+        return;
+      }
+      const planChanged = report.added.length>0 || report.timing.length>0;
+      setWf(w=>({
+        ...w,
+        hostawayLoaded:true,
+        hostawaySource:importSource,
+        staleGeneration:(planChanged && w.shiftsGenerated)?true:w.staleGeneration
+      }));
+      setHostawayReport({ ...report, srcLabel });
+      const parts = [
+        report.added.length && `${report.added.length} ${report.added.length===1?'nuovo':'nuovi'}`,
+        report.timing.length && `${report.timing.length} ${report.timing.length===1?'cambiato':'cambiati'}`,
+        (report.keptManual.length+report.missing.length) && `${report.keptManual.length+report.missing.length} da controllare`,
+        report.guests.length && `ospiti aggiornati in ${report.guests.length}`,
+      ].filter(Boolean);
+      showToast(`✓ Import ${srcLabel}: ${parts.join(' · ')}`);
+      return;
+    }
 
     const isSameJob = (a,b) =>
       a.dateISO===b.dateISO &&
@@ -13727,8 +14589,8 @@ function App(){
 
     if(planningWeekOffset===null) setPlanningWeekOffset(weekOffset);
     setModal(null);
+    setHostawayReport(null);
 
-    const srcLabel = importSource==='hostaway_api' ? 'Hostaway API' : 'CSV';
     showToast(`✓ ${incoming.length} turni importati da ${srcLabel}`);
   };
 
@@ -14187,6 +15049,26 @@ function App(){
     if(filtered.length === job.earlyLeaveSuggestions.length) return job;
     return {...job, earlyLeaveSuggestions: filtered.length ? filtered : null};
   };
+  // Edits from the Tabella. Same rules as saveJob: times/people make the duty manual (so
+  // Rigenera leaves it alone); a note alone does not (manual:false).
+  const updateJobFromTable=(id, patch, {manual=true}={})=>{
+    if(blockIfWeekMismatch()) return false;
+    setJobs(p=>p.map(j=>{
+      if(j.id!==id) return j;
+      let u={...j,...patch};
+      if(manual) u={...u,manualEdited:true,schedulerDecisionCode:'manual_edit'};
+      if(patch.cleanerIds) u={...u,cleanerIds:dedupeCleanerIds(patch.cleanerIds)};
+      u=stripEarlyLeaveForOverriddenCleaners(u);
+      return {...u,status:calcJobStatus(u)};
+    }));
+    return true;
+  };
+  const printSupervisorWeek=()=>{
+    if(blockIfWeekMismatch()) return;
+    if(!jobs.length) return;
+    try{const proceed=confirmScheduleExportDespiteBlockingIssues(jobs,weekOffset,showToast,'Supervisor');if(!proceed)return;exportSupervisorScheduleXLSX(jobs,weekOffset,conflicts);showToast?.('✓ Export Supervisor avviato','ok');}
+    catch(e){showToast?.('Export Supervisor fallito: '+String(e.message||e),'error');console.error('[Supervisor export]',e);}
+  };
   const saveJob=form=>{
     if(blockIfWeekMismatch()) return;
     const cleanForm={...form,cleanerIds:dedupeCleanerIds(form.cleanerIds)};
@@ -14229,32 +15111,54 @@ function App(){
     });
   };
 
-  const NAV=[{id:'week',icon:'📅',label:'Sett.'},{id:'day',icon:'📋',label:DAY_IT[selDay]},{id:'props',icon:'🏢',label:'Prop.'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(CLEANFLOW_DEBUG_CENTER_ENABLED?[{id:'debug',icon:'🧪',label:'Debug'}]:[])];
+  const NAV=[{id:'week',icon:'📅',label:'Sett.'},{id:'day',icon:'📋',label:DAY_IT[selDay]},{id:'props',icon:'🏢',label:'Prop.'},...(AI_ENABLED?[{id:'chat',icon:'🤖',label:'AI'}]:[]),{id:'cleaners',icon:'👥',label:'Team'},...(canSeeDebug()?[{id:'debug',icon:'🧪',label:'Debug'}]:[])];
 
   // ── LOGIN SCREEN — after all hooks ────────────────────────────────────────
-  if(!authed) return(
+  // Also shown when the server rejected the session mid-use (authLost): App state is
+  // kept, so after logging in again the week in progress is still there.
+  if(!authed || authLost) return(
     <div style={{minHeight:'100vh',background:'#F5F2EE',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Nunito',sans-serif"}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
       <div style={{background:'#0A0A0A',borderRadius:24,padding:'44px 36px',width:'100%',maxWidth:380,boxShadow:'0 18px 50px rgba(0,0,0,0.22)',border:'1px solid rgba(255,255,255,0.10)',textAlign:'center'}}>
         <img src="./arco-collection.jpeg" alt="Arco Collection" style={{display:'block',width:'100%',maxWidth:240,margin:'0 auto 22px',filter:'invert(1)'}} />
         <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800,color:'#F7F3EC',letterSpacing:'-0.5px',marginBottom:4}}>CleanFlow</div>
         <div style={{fontSize:12,color:'rgba(255,255,255,0.45)',letterSpacing:1,marginBottom:28}}>Scheduling · Malta</div>
+        {authLost&&<div style={{fontSize:12,color:'#F7C77A',fontWeight:700,marginBottom:14,lineHeight:1.4}}>{authLost}<br/>Il lavoro in corso su questo dispositivo è conservato.</div>}
+        <input type="text" value={loginUser}
+          onChange={e=>{setLoginUser(e.target.value);setPwError('');}}
+          placeholder="Nome utente" autoFocus={!loginUser} autoComplete="username" autoCapitalize="none" autoCorrect="off" spellCheck={false}
+          style={{width:'100%',padding:'13px 16px',borderRadius:12,border:`1.5px solid ${pwError?C.conflict:'rgba(255,255,255,0.18)'}`,background:'#141414',color:'#F7F3EC',fontSize:16,textAlign:'center',fontFamily:'inherit',marginBottom:10,outline:'none'}}
+        />
         <input type="password" value={pwInput}
-          onChange={e=>{setPwInput(e.target.value);setPwError(false);}}
-          onKeyDown={e=>{if(e.key==='Enter'){if(pwInput==='172390'){sessionStorage.setItem('cf_auth','1');setAuthed(true);}else setPwError(true);}}}
-          placeholder="Password" autoFocus
+          onChange={e=>{setPwInput(e.target.value);setPwError('');}}
+          onKeyDown={e=>{if(e.key==='Enter')doLogin();}}
+          placeholder="Password" autoFocus={!!loginUser} autoComplete="current-password"
           style={{width:'100%',padding:'13px 16px',borderRadius:12,border:`1.5px solid ${pwError?C.conflict:'rgba(255,255,255,0.18)'}`,background:'#141414',color:'#F7F3EC',fontSize:16,textAlign:'center',letterSpacing:4,fontFamily:'inherit',marginBottom:10,outline:'none'}}
         />
-        {pwError&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>Password errata</div>}
-        <button onClick={()=>{if(pwInput==='172390'){sessionStorage.setItem('cf_auth','1');setAuthed(true);}else setPwError(true);}}
+        {pwError&&<div style={{fontSize:12,color:'#FF6B7A',fontWeight:700,marginBottom:10}}>{pwError}</div>}
+        <button onClick={doLogin} disabled={loggingIn}
           onMouseDown={e=>e.currentTarget.style.background='#B9825A'} onMouseUp={e=>e.currentTarget.style.background='#A66A43'}
-          style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:'pointer',fontFamily:'inherit'}}>
-          Accedi
+          style={{width:'100%',padding:'13px',borderRadius:12,background:'#A66A43',color:'white',fontWeight:800,fontSize:15,border:'none',cursor:loggingIn?'wait':'pointer',opacity:loggingIn?0.7:1,fontFamily:'inherit'}}>
+          {loggingIn?'Accesso…':'Accedi'}
         </button>
       </div>
     </div>
   );
 
+
+  // Provisional password (set by the owner): the user picks their own before the app opens.
+  if(mustChangePw) return(
+    <div style={{minHeight:'100vh',background:'#F5F2EE',display:'flex',alignItems:'center',justifyContent:'center',fontFamily:"'Nunito',sans-serif"}}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}`}</style>
+      <div style={{background:'#0A0A0A',borderRadius:24,padding:'40px 32px',width:'100%',maxWidth:400,boxShadow:'0 18px 50px rgba(0,0,0,0.22)',border:'1px solid rgba(255,255,255,0.10)',textAlign:'center'}}>
+        <div style={{fontFamily:"'Syne',sans-serif",fontSize:22,fontWeight:800,color:'#F7F3EC',marginBottom:8}}>Imposta la tua password</div>
+        <div style={{fontSize:13,color:'rgba(255,255,255,0.6)',lineHeight:1.5,marginBottom:22}}>Stai usando una password provvisoria. Scegline una tua (almeno 10 caratteri): da ora la conoscerai solo tu.</div>
+        <ChangePasswordForm dark knownCurrent={provisionalPwRef.current}
+          onDone={()=>{ provisionalPwRef.current=''; setMustChangePw(false); setAuthEpoch(e=>e+1); showToast('Password impostata','ok'); }}
+          onCancel={doLogout} cancelLabel="Esci"/>
+      </div>
+    </div>
+  );
 
   const dataEssentialsMissing = PROPERTIES.length===0 || CLEANERS.length===0;
 
@@ -14296,22 +15200,30 @@ function App(){
           </div>
         </div>
       ) : (<>
-      {tab==='week'&&<WeekView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDaySelect={d=>{setSelDay(d);setTab('day');}} onConflictDay={goToConflictDay} onLoadTemplate={()=>setModal('template')} onImportHostaway={()=>setModal('hostaway')} onGenerate={handleGenerate} wf={wf} dataReady={dataReady} genGate={genGate} trainingOk={trainingStatus.ok} trainingMissing={trainingStatus.propertiesWithoutTraining.length} trainingMissingJobs={trainingStatus.jobsWithoutTraining.length} onApplyFallback={applyFallbackReallocation}/>}
-      {tab==='day'&&<DayView jobs={visibleJobs} conflicts={visibleConflicts} day={selDay} setDay={d=>{setSelDay(d);setHighlightJob(null);}} weekOffset={weekOffset} onAdd={openAdd} onEdit={openEdit} onFix={fixConflict} onFindSolution={findSolution} highlightJobId={highlightJob} setHighlightJob={setHighlightJob} onLoadTemplate={()=>setModal('template')} onCleanerClick={openCleanerWeek}/>}
-      {tab==='props'&&<PropertiesView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDayAndJobSelect={(day,jobId)=>{setSelDay(day);setHighlightJob(jobId);setTab('day');}}/>}
-      {tab==='cleaners'&&<CleanersView jobs={visibleJobs} selDay={selDay} weekOffset={weekOffset} onDaySelect={d=>setSelDay(d)} dataVersion={dataVersion}/>}
+      {hostawayReport&&<ViewBoundary name="import Hostaway"><HostawayImportReport report={hostawayReport} onClose={()=>setHostawayReport(null)}
+        onRemoveMissing={ids=>{
+          if(!confirm(`Rimuovere ${ids.length===1?'il turno':ids.length+' turni'} che non ${ids.length===1?'è':'sono'} più in Hostaway?`)) return;
+          setJobs(p=>p.filter(j=>!ids.includes(j.id)));
+          setHostawayReport(r=>r?{...r,missing:r.missing.filter(m=>!ids.includes(m.job.id))}:r);
+          showToast(ids.length===1?'Turno rimosso':`${ids.length} turni rimossi`);
+        }}
+        onOpenJob={j=>{setSelDay(j.day);setHighlightJob(j.id);setTab('day');}}/></ViewBoundary>}
+      {tab==='week'&&<ViewBoundary name="Settimana"><WeekView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDaySelect={d=>{setSelDay(d);setTab('day');}} onConflictDay={goToConflictDay} onLoadTemplate={()=>setModal('template')} onImportHostaway={()=>setModal('hostaway')} onGenerate={handleGenerate} wf={wf} dataReady={dataReady} genGate={genGate} trainingOk={trainingStatus.ok} trainingMissing={trainingStatus.propertiesWithoutTraining.length} trainingMissingJobs={trainingStatus.jobsWithoutTraining.length} onApplyFallback={applyFallbackReallocation}/></ViewBoundary>}
+      {tab==='day'&&<ViewBoundary name="Giorno"><DayView jobs={visibleJobs} conflicts={visibleConflicts} day={selDay} setDay={d=>{setSelDay(d);setHighlightJob(null);}} weekOffset={weekOffset} onAdd={openAdd} onEdit={openEdit} onFix={fixConflict} onFindSolution={findSolution} highlightJobId={highlightJob} setHighlightJob={setHighlightJob} onLoadTemplate={()=>setModal('template')} onCleanerClick={openCleanerWeek}/></ViewBoundary>}
+      {tab==='props'&&<ViewBoundary name="Proprietà"><PropertiesView jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} onDayAndJobSelect={(day,jobId)=>{setSelDay(day);setHighlightJob(jobId);setTab('day');}}/></ViewBoundary>}
+      {tab==='cleaners'&&<ViewBoundary name="Team"><CleanersView jobs={visibleJobs} selDay={selDay} weekOffset={weekOffset} onDaySelect={d=>setSelDay(d)} dataVersion={dataVersion}/></ViewBoundary>}
       </>)}
       {AI_ENABLED&&tab==='chat'&&<ChatView msgs={msgs} chatIn={chatIn} setChatIn={setChatIn} onSend={sendChat} isLoading={aiLoad} chatRef={chatRef} onApplySuggestion={applySuggestion}/>}
       {/* Debug Center — read-only diagnostics. Receives the SAME source-of-truth state
           the rest of the app renders (jobs/conflicts, not the week-mismatch-blanked
           visibleJobs) and never receives a setter. */}
-      {CLEANFLOW_DEBUG_CENTER_ENABLED&&tab==='debug'&&<DebugCenter
+      {canSeeDebug()&&tab==='debug'&&<ViewBoundary name="Debug Center"><DebugCenter
         jobs={jobs} weekOffset={weekOffset} conflicts={conflicts}
         cleaners={CLEANERS} properties={PROPERTIES} training={TRAINING} travelBuffers={TRAVEL_BUFFERS}
         showToast={showToast} dataVersion={dataVersion} isDesktop={isDesktop}
         debugTrace={lastDebugTrace}
         replayFixture={lastReplayFixture}
-        onBack={()=>setTab('week')}/>}
+        onBack={()=>setTab('week')}/></ViewBoundary>}
     </div>
   );
 
@@ -14319,18 +15231,28 @@ function App(){
     <div style={{background:C.bg,minHeight:'100vh',fontFamily:"'Nunito',sans-serif",display:'flex',flexDirection:'column'}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}button{font-family:'Nunito',sans-serif;outline:none}textarea,input,select{font-family:'Nunito',sans-serif;outline:none}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#ccc;border-radius:2px}`}</style>
       <Toast toast={toast}/>
+      {tableMounted&&<div style={{display:(tab==='table'&&isDesktop)?'block':'none'}}><ViewBoundary name="Tabella"><TableView
+        jobs={visibleJobs} conflicts={visibleConflicts} weekOffset={weekOffset} initialDay={selDay}
+        publishLabel={dirty?(serverVersionChanged?'⚠ Modifiche non pubblicate · c\'è una versione pubblicata più recente':'● Modifiche non pubblicate'):(publishedStatus==='loaded'?'✓ Tutto pubblicato':'Settimana non ancora pubblicata')}
+        publishBusy={publishing} onPublish={()=>publishCurrentSchedule()} onPrint={printSupervisorWeek}
+        onUpdateJob={updateJobFromTable} onOpenCleaner={openCleanerWeek}
+        onClose={()=>{setTab(tableBackTabRef.current||'week');setTableMounted(false);}} onMinimize={()=>setTab(tableBackTabRef.current||'week')}
+        showToast={showToast}/></ViewBoundary></div>}
+      {tableMounted&&isDesktop&&tab!=='table'&&<button onClick={()=>setTab('table')} title="Riapri la tabella com'era"
+        style={{position:'fixed',right:20,bottom:20,zIndex:250,display:'flex',alignItems:'center',gap:8,background:'#0E0D0C',color:'#F7F3EC',border:'1px solid rgba(255,255,255,0.18)',borderRadius:12,padding:'10px 16px',fontWeight:800,fontSize:13,cursor:'pointer',fontFamily:'inherit',boxShadow:'0 10px 30px rgba(0,0,0,0.25)'}}>
+        📊 Tabella{dirty?' · modifiche non pubblicate':''} · Riapri</button>}
 
       {isDesktop?(
         // ── DESKTOP LAYOUT ──
         <div style={{display:'flex',height:'100vh',overflow:'hidden'}}>
-          <Sidebar tab={tab} setTab={setTab} selDay={selDay} weekOffset={weekOffset} setWeekOffset={setWeekOffset} wf={wf} totalC={visibleTotalC} jobs={visibleJobs} conflicts={visibleConflicts} onGenerate={handleGenerate} onConflictDay={goToConflictDay} setModal={setModal} dataReady={dataReady} genGate={genGate} refreshSheetData={refreshSheetData} sheetLoading={sheetLoading} onLastMinute={openLastMinuteModal} supervisorName={supervisorNameUI} onChangeSupervisorName={changeSupervisorName} onPublish={()=>publishCurrentSchedule()} publishing={publishing} publishedStatus={publishedStatus} weekMismatchActive={weekMismatchActive} showToast={showToast}/>
+          <Sidebar tab={tab} setTab={setTab} selDay={selDay} weekOffset={weekOffset} setWeekOffset={setWeekOffset} wf={wf} totalC={visibleTotalC} jobs={visibleJobs} conflicts={visibleConflicts} onGenerate={handleGenerate} onConflictDay={goToConflictDay} setModal={setModal} dataReady={dataReady} genGate={genGate} refreshSheetData={refreshSheetData} sheetLoading={sheetLoading} onLastMinute={openLastMinuteModal} supervisorName={supervisorNameUI} onChangeSupervisorName={doLogout} onPublish={()=>publishCurrentSchedule()} publishing={publishing} publishedStatus={publishedStatus} weekMismatchActive={weekMismatchActive} showToast={showToast}/>
           <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column',overflow:'hidden'}}>
             {/* Published schedule status banner (desktop) */}
             <PublishedScheduleBanner
               publishedStatus={publishedStatus}
               publishedJobsSnapshot={publishedJobsSnapshot}
               dirty={dirty}
-              draftRestored={draftRestored}
+              draftRestored={draftRestored} serverVersionChanged={serverVersionChanged}
               publishing={publishing}
               jobs={jobs}
               conflicts={conflicts}
@@ -14429,7 +15351,8 @@ function App(){
             </div>
             <div style={{display:'flex',alignItems:'center',gap:8,marginTop:8,fontSize:11,color:'#9FB6CC'}}>
               <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>👤 Supervisor: {supervisorNameUI||'non impostato'}</span>
-              <button onClick={changeSupervisorName} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Cambia</button>
+              <button onClick={()=>setModal('changePassword')} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Password</button>
+              <button onClick={doLogout} style={{background:'rgba(255,255,255,0.12)',color:'white',border:'1px solid rgba(255,255,255,0.15)',borderRadius:8,padding:'3px 10px',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Esci</button>
             </div>
           </div>
 
@@ -14437,7 +15360,7 @@ function App(){
             publishedStatus={publishedStatus}
             publishedJobsSnapshot={publishedJobsSnapshot}
             dirty={dirty}
-            draftRestored={draftRestored}
+            draftRestored={draftRestored} serverVersionChanged={serverVersionChanged}
             publishing={publishing}
             jobs={jobs}
             conflicts={conflicts}
@@ -14562,6 +15485,7 @@ function App(){
 
       {modal==='hostaway'&&<Modal onClose={()=>setModal(null)}><HostawayModal onImport={doImportHostaway} onClose={()=>setModal(null)} weekOffset={weekOffset}/></Modal>}
       {modal==='generateResult'&&<Modal onClose={()=>{setModal(null);setGenerateResult(null);}}><GenerateModal result={generateResult} constraints={generateResult?.constraints} onConfirm={applyGenerate} onClose={()=>{setModal(null);setGenerateResult(null);}} onGenerate={(startDay,endDay)=>handleGenerate(startDay,endDay)} generating={isGenerating}/></Modal>}
+      {modal==='changePassword'&&<Modal onClose={()=>setModal(null)}><ChangePasswordForm onDone={()=>{setModal(null);showToast('Password cambiata. Gli altri dispositivi collegati sono stati disconnessi.','ok');}} onCancel={()=>setModal(null)}/></Modal>}
       {isGenerating&&(
         <div style={{position:'fixed',inset:0,zIndex:500,background:'rgba(0,0,0,0.45)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12,color:'#fff'}}>
           <div style={{fontSize:34,animation:'spin 1.2s linear infinite'}}>⟳</div>
@@ -14717,10 +15641,12 @@ function App(){
       {modal==='overwriteDiff'&&<Modal onClose={()=>setModal(null)}><OverwriteDiffModal localJobs={jobs} publishedJobs={publishedJobsSnapshot?.jobs||[]} onClose={()=>setModal(null)} onConfirm={()=>{setModal(null); publishCurrentSchedule(true);}}/></Modal>}
       {modal==='cleanerWeek'&&quickCleanerId&&<Modal onClose={()=>{setModal(null);setQuickCleanerId(null);}}>
         <CleanerWeekPopup cleanerId={quickCleanerId} jobs={jobs} weekOffset={weekOffset}/>
+        <button onClick={async()=>{ if(blockIfWeekMismatch()) return; const ok=await copyTextToClipboard(buildCleanerWeekText(quickCleanerId,jobs,weekOffset)); showToast(ok?'Turni copiati: incollali o seguili in When I Work':'Copia non riuscita',ok?'ok':'error'); }}
+          style={{marginTop:16,width:'100%',padding:'12px',borderRadius:10,background:'#A66A43',color:'white',fontWeight:800,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>📋 Copia per When I Work</button>
         <button onClick={()=>{setModal(null);setQuickCleanerId(null);}} style={{marginTop:16,width:'100%',padding:'12px',borderRadius:10,background:'#F0EDE8',color:C.text,fontWeight:700,fontSize:13,border:'none',cursor:'pointer',fontFamily:'inherit'}}>Chiudi</button>
       </Modal>}
     </div>
   );
 }
 
-const root = ReactDOM.createRoot(document.getElementById('root')); root.render(<App />);</script></body></html>
+const root = ReactDOM.createRoot(document.getElementById('root')); root.render(<ViewBoundary root name="app"><App /></ViewBoundary>);</script></body></html>

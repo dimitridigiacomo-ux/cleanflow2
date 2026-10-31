@@ -2,7 +2,11 @@
 
 CleanFlow pianifica i turni di pulizia di un portafoglio di affitti brevi a Malta.
 
-- **Frontend**: un'unica SPA React in `index.html`. JSX tradotto nel browser da Babel standalone, nessun build step.
+- **Frontend**: un'unica SPA React in `index.html`, scritta in JSX.
+  - In locale il JSX lo traduce il browser con Babel standalone (tag CDN in `index.html`).
+  - **Al deploy** lo traduce GitHub Actions con `tools/build/precompile.js`: stessa versione di Babel, stesse opzioni del browser, output verificato identico byte per byte. Il sorgente nel repo non cambia; cambia solo la copia pubblicata.
+  - Se si aggiorna Babel nel tag CDN, va aggiornato anche `tools/build/package.json` (+ lock), altrimenti il deploy si ferma di proposito.
+  - Ritorno d'emergenza al Babel nel browser: lancio manuale del workflow di deploy con `precompile` = false.
 - **Backend**: Google Apps Script. Pubblica/ripristina le settimane e fa da proxy verso Hostaway.
   - **Non sta in questo repo pubblico, e non deve mai finirci** (contiene lo Spreadsheet ID). Vive in un **repo privato separato**, `CleanFlow-backend` (cartella accanto a questa), il cui primo commit è il codice in produzione al 2026-10-17.
   - Il branch locale `main` di questo repo ne contiene una copia di agosto, identica a quella in produzione a ottobre, ma è storico: si lavora sul repo privato.

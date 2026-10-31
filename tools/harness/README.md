@@ -7,9 +7,12 @@ Non serve nessuna dipendenza: basta Node 18+ e git.
 ```
 node tools/harness/verify-scheduler.js   # regressione + invarianti rigenerazione parziale
 node tools/harness/verify-solver.js      # solver locale + barriera max-worked-days
+node tools/harness/verify-hostaway-merge.js   # re-import Hostaway "solo novità" (dati sintetici, pochi secondi)
 ```
 
-Exit code 0 = `ALL PASS`. Ogni suite impiega 1–3 minuti.
+Exit code 0 = `ALL PASS`. Le prime due suite impiegano 1–3 minuti ciascuna.
+
+`verify-hostaway-merge.js` non usa fixture: prova `mergeHostawayImportJobs` con prenotazioni inventate. Copre: import identico, prenotazione nuova, ospiti cambiati, finestra cambiata (con e senza spostamento dell'orario), turni manuali e rescue protetti, checkout che diventa B2B, prenotazione cancellata (solo segnalata), dati persi al ricaricamento ripristinati in silenzio, fallback dello scheduler, chiavi duplicate, nota della supervisor, CSV, altre settimane e template. Controllo di sensibilità: togliendo la protezione dei turni manuali, i controlli 6 e 7 falliscono.
 
 ## Opzioni
 
